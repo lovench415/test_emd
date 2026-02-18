@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-F5-TTS Enhanced — Full Training Pipeline
-==========================================
+F5-TTS Enhanced — Training Pipeline (v3 — fully corrected)
+============================================================
 
-Исправленный pipeline:
-  - Загрузка CFM (не голый DiT) → DiT = cfm.transformer
-  - Mel в формате channels-LAST: (B, T, mel_dim) как в оригинале
-  - Random span masking (как в F5-TTS training)
-  - Flow matching: v_target = x₁ - (1-σ)·x₀, loss на masked region
-  - EMA для adapter параметров
-  - emotion2vec отдельно от model (не внутри nn.Module)
+Fixed vs earlier versions:
+  - EnhancedF5TTS wraps CFM (not bare DiT): cfm_model=cfm
+  - Uses enhanced.install_hooks() for all hook registration
+  - Uses enhanced.predict_velocity() for direct DiT forward
+  - All mel tensors: (B, T, mel_dim) — channels LAST
+  - Random span masking consistent with F5-TTS training
+  - CFG dropout during training (drop_audio_cond / drop_text)
+  - EMA with proper device handling on resume
+  - Loss only on generation region (not reference/padding)
 
-Запуск:
+Usage:
     python scripts/finetune_enhanced.py --config configs/finetune_crosslang_emotion.yaml
     python scripts/finetune_enhanced.py --config ... --resume ckpts/enhanced/step_50000
     python scripts/finetune_enhanced.py --export ckpts/enhanced/best --output adapters.pt
@@ -20,6 +22,7 @@ F5-TTS Enhanced — Full Training Pipeline
 import argparse
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -33,16 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from f5_tts_enhanced.model.enhanced_dit import EnhancedF5TTS
 from f5_tts_enhanced.model.emotion_extractor import Emotion2vecExtractor
-from f5_tts_enhanced.data.dataset import create_dataloader, lang_to_id
+from f5_tts_enhanced.data.dataset import create_dataloader
 
 
 # =========================================================================
-# EMA for adapter params
+# EMA for adapter params (with device-safe resume)
 # =========================================================================
 
 class AdapterEMA:
-    """Exponential Moving Average только для trainable (adapter) параметров."""
-
     def __init__(self, model: nn.Module, decay: float = 0.9999):
         self.decay = decay
         self.shadow = {}
@@ -58,7 +59,6 @@ class AdapterEMA:
                 self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def apply(self, model: nn.Module):
-        """Применить EMA веса (для eval/inference)."""
         self.backup.clear()
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
@@ -66,96 +66,70 @@ class AdapterEMA:
                 param.data.copy_(self.shadow[name])
 
     def restore(self, model: nn.Module):
-        """Восстановить оригинальные веса после eval."""
         for name, param in model.named_parameters():
             if name in self.backup:
                 param.data.copy_(self.backup[name])
         self.backup.clear()
 
     def state_dict(self):
-        return {"shadow": self.shadow, "decay": self.decay}
+        return {"shadow": {k: v.cpu() for k, v in self.shadow.items()},
+                "decay": self.decay}
 
-    def load_state_dict(self, state):
-        self.shadow = state["shadow"]
+    def load_state_dict(self, state, device=None):
+        """Load EMA state with proper device mapping."""
         self.decay = state.get("decay", self.decay)
+        loaded_shadow = state.get("shadow", {})
+        for name in self.shadow:
+            if name in loaded_shadow:
+                src = loaded_shadow[name]
+                if device is not None:
+                    src = src.to(device)
+                self.shadow[name].copy_(src)
 
 
 # =========================================================================
-# Flow Matching
+# Flow Matching (OT-CFM)
 # =========================================================================
 
 class FlowMatchingScheduler:
-    """
-    OT-CFM scheduler для F5-TTS.
-
-    x_t = (1 - (1-σ)t)·x₀ + t·x₁     (σ обычно 0)
-    v_target = x₁ - (1-σ)·x₀
-    """
+    """σ=0: x_t = (1-t)·x₀ + t·x₁,  v = x₁ - x₀"""
 
     def __init__(self, sigma: float = 0.0):
         self.sigma = sigma
 
-    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.rand(batch_size, device=device)
+    def sample_timesteps(self, B: int, device: torch.device) -> torch.Tensor:
+        return torch.rand(B, device=device)
 
-    def interpolate(
-        self,
-        x_0: torch.Tensor,    # noise (B, T, D)
-        x_1: torch.Tensor,    # clean mel (B, T, D)
-        t: torch.Tensor,      # (B,)
-    ):
-        t = t[:, None, None]                           # (B, 1, 1)
+    def interpolate(self, x_0, x_1, t):
+        t = t[:, None, None]
         mu_t = (1 - (1 - self.sigma) * t) * x_0 + t * x_1
         v_target = x_1 - (1 - self.sigma) * x_0
         return mu_t, v_target
 
-    def compute_loss(
-        self,
-        v_pred: torch.Tensor,     # (B, T, D)
-        v_target: torch.Tensor,   # (B, T, D)
-        loss_mask: torch.Tensor,  # (B, T)  — True where to compute loss
-    ) -> torch.Tensor:
-        mask = loss_mask.unsqueeze(-1).float()            # (B, T, 1)
-        loss = F.mse_loss(v_pred, v_target, reduction="none")  # (B, T, D)
-        loss = (loss * mask).sum() / (mask.sum() * v_pred.shape[-1] + 1e-8)
-        return loss
+    def compute_loss(self, v_pred, v_target, loss_mask):
+        """Masked MSE. loss_mask: (B, T) True=compute loss."""
+        mask = loss_mask.unsqueeze(-1).float()
+        loss = F.mse_loss(v_pred, v_target, reduction="none")
+        return (loss * mask).sum() / (mask.sum() * v_pred.shape[-1] + 1e-8)
 
 
 # =========================================================================
-# Random Span Masking (как в F5-TTS training)
+# Random Span Masking
 # =========================================================================
 
-def random_span_mask(
-    mel_lengths: torch.Tensor,    # (B,) — реальные длины
-    max_len: int,
-    mask_ratio_range: tuple = (0.7, 1.0),
-) -> torch.Tensor:
-    """
-    Создать random span mask для обучения.
-
-    Маскируемая часть = region для генерации (target).
-    Немаскированная часть = condition (reference prompt).
-
-    Returns:
-        gen_mask: (B, max_len) — True = generate (masked/target), False = condition
-    """
+def random_span_mask(mel_lengths, max_len, mask_ratio_range=(0.7, 1.0)):
+    """True = generate (target), False = condition (reference prompt)."""
     B = mel_lengths.shape[0]
     gen_mask = torch.zeros(B, max_len, dtype=torch.bool)
-
     for i in range(B):
         L = mel_lengths[i].item()
         if L < 4:
             gen_mask[i, :L] = True
             continue
-
-        ratio = torch.empty(1).uniform_(*mask_ratio_range).item()
+        ratio = random.uniform(*mask_ratio_range)
         mask_len = max(int(L * ratio), 1)
-
-        # Random start position
-        start = torch.randint(0, max(L - mask_len, 1), (1,)).item()
-        end = min(start + mask_len, L)
-        gen_mask[i, start:end] = True
-
+        start = random.randint(0, max(L - mask_len, 1) - 1)
+        gen_mask[i, start:min(start + mask_len, L)] = True
     return gen_mask
 
 
@@ -182,10 +156,10 @@ class Trainer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         print("=" * 60)
-        print("  F5-TTS Enhanced Training")
+        print("  F5-TTS Enhanced Training (v3)")
         print("=" * 60)
 
-        self.cfm, self.enhanced = self._build_model()
+        self.enhanced = self._build_model()
         self.emotion_extractor = self._build_emotion_extractor()
         self.flow = FlowMatchingScheduler(sigma=0.0)
         self.train_loader, self.val_loader = self._build_dataloaders()
@@ -194,6 +168,10 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self._use_amp())
         self.writer = self._build_logger()
 
+        # CFG dropout probabilities (matching F5-TTS defaults)
+        self.audio_drop_prob = self.config.get("model", {}).get("audio_drop_prob", 0.3)
+        self.cond_drop_prob = self.config.get("model", {}).get("cond_drop_prob", 0.2)
+
         if resume_from:
             self._resume(resume_from)
         elif ckpt_cfg.get("resume_from"):
@@ -201,31 +179,28 @@ class Trainer:
 
         self._print_summary()
 
-    # ─── Build ────────────────────────────────────────────────────────
+    # ─── Build model ──────────────────────────────────────────────────
 
-    def _build_model(self):
-        """Загрузить CFM (содержит DiT), обернуть DiT в EnhancedF5TTS."""
+    def _build_model(self) -> EnhancedF5TTS:
+        """Build CFM → wrap with EnhancedF5TTS → install hooks → to device."""
         base_cfg = self.config.get("base_model", {})
         model_cfg = self.config.get("model", {}).get("arch", {})
         adapter_cfg = self.config.get("adapters", {})
         emo_cfg = self.config.get("emotion", {})
+        mel_cfg = self.config.get("model", {}).get("mel_spec", {})
 
         try:
             from f5_tts.model import CFM, DiT
             from f5_tts.model.utils import get_tokenizer
 
-            # Vocab
             vocab_path = base_cfg.get("vocab", "")
             if vocab_path.startswith("hf://"):
                 from huggingface_hub import hf_hub_download
                 parts = vocab_path.replace("hf://", "").split("/")
-                repo, filename = "/".join(parts[:2]), "/".join(parts[2:])
-                vocab_path = hf_hub_download(repo_id=repo, filename=filename)
+                vocab_path = hf_hub_download("/".join(parts[:2]), "/".join(parts[2:]))
 
             vocab_char_map, vocab_size = get_tokenizer(vocab_path, "custom")
-            mel_cfg = self.config.get("model", {}).get("mel_spec", {})
 
-            # Create CFM(transformer=DiT(...))
             dit = DiT(
                 dim=model_cfg.get("dim", 1024),
                 depth=model_cfg.get("depth", 22),
@@ -256,8 +231,7 @@ class Trainer:
                 if ckpt_path.startswith("hf://"):
                     from huggingface_hub import hf_hub_download
                     parts = ckpt_path.replace("hf://", "").split("/")
-                    repo, filename = "/".join(parts[:2]), "/".join(parts[2:])
-                    local_path = hf_hub_download(repo_id=repo, filename=filename)
+                    local_path = hf_hub_download("/".join(parts[:2]), "/".join(parts[2:]))
                 else:
                     local_path = ckpt_path
 
@@ -266,18 +240,18 @@ class Trainer:
                     from safetensors.torch import load_file
                     state = load_file(local_path, device="cpu")
                 else:
-                    state = torch.load(local_path, map_location="cpu")
-                    if "model_state_dict" in state:
-                        state = state["model_state_dict"]
-                    elif "ema_model_state_dict" in state:
+                    state = torch.load(local_path, map_location="cpu", weights_only=True)
+                    if "ema_model_state_dict" in state:
                         state = state["ema_model_state_dict"]
+                    elif "model_state_dict" in state:
+                        state = state["model_state_dict"]
 
                 cfm.load_state_dict(state, strict=False)
                 print("[Model] Pretrained weights loaded")
 
         except ImportError as e:
             print(f"[WARNING] f5_tts not installed ({e}), using placeholder")
-            dit = nn.Identity()
+            dit = nn.Linear(100, 100)  # placeholder
 
             class FakeCFM(nn.Module):
                 def __init__(self):
@@ -285,28 +259,28 @@ class Trainer:
                     self.transformer = dit
             cfm = FakeCFM()
 
-        # Wrap DiT with EnhancedF5TTS
+        # Wrap CFM with EnhancedF5TTS (pass entire CFM, not just DiT!)
         lora_cfg = adapter_cfg.get("lora", {})
         emo_ext = emo_cfg.get("extractor", {})
 
         enhanced = EnhancedF5TTS(
-            cfm_model=cfm.transformer,
+            cfm_model=cfm,                                     # ← full CFM
             emotion_dim=emo_ext.get("emotion_dim", 768),
             emotion_mode=emo_cfg.get("conditioning", {}).get("mode", "adaln"),
             lora_rank=lora_cfg.get("rank", 16),
             lora_alpha=lora_cfg.get("alpha", 16.0),
             lora_dropout=lora_cfg.get("dropout", 0.05),
-            text_dim=model_cfg.get("text_dim", 512),
-            add_language_emb=adapter_cfg.get("language_embedding", {}).get("enabled", True),
             freeze_base=adapter_cfg.get("freeze_base", True),
+            num_dit_blocks=model_cfg.get("depth", 22),
+            hidden_dim=model_cfg.get("dim", 1024),
+            text_dim=model_cfg.get("text_dim", 512),
         )
-        enhanced.install_hooks()
+        enhanced.install_hooks()                                # ← install all hooks
         enhanced = enhanced.to(self.device)
 
-        return cfm, enhanced
+        return enhanced
 
     def _build_emotion_extractor(self) -> Emotion2vecExtractor:
-        """Emotion2vec — отдельно от модели, с кешем."""
         emo_cfg = self.config.get("emotion", {}).get("extractor", {})
         extractor = Emotion2vecExtractor(
             model_size=emo_cfg.get("model_size", "large"),
@@ -356,7 +330,6 @@ class Trainer:
                 meta_val, max_frames_per_batch=mf, max_samples_per_batch=ms,
                 num_workers=nw, shuffle=False, **kw)
 
-        # Warmup emotion cache
         print("[Trainer] Warming up emotion cache...")
         paths = [s["audio_path"] for s in train_ds.samples]
         self.emotion_extractor.warmup_cache(paths)
@@ -389,12 +362,11 @@ class Trainer:
             progress = (step - warmup) / max(1, max_steps - warmup)
             return max(0.1, 0.5 * (1 + math.cos(math.pi * progress)))
 
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-        return opt, sched
+        return opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     def _use_amp(self):
-        return self.config.get("optim", {}).get("mixed_precision", "bf16") in ("fp16", "bf16") \
-               and torch.cuda.is_available()
+        return (self.config.get("optim", {}).get("mixed_precision", "bf16")
+                in ("fp16", "bf16") and torch.cuda.is_available())
 
     def _amp_dtype(self):
         mp = self.config.get("optim", {}).get("mixed_precision", "bf16")
@@ -418,12 +390,11 @@ class Trainer:
     def train_step(self, batch: dict) -> dict:
         self.enhanced.train()
 
-        # All tensors: mel is (B, T, mel_dim) = channels LAST ✓
-        mel = batch["mel"].to(self.device)               # (B, T, D)
-        text_ids = batch["text_ids"].to(self.device)      # (B, L)
-        mel_lengths = batch["mel_lengths"].to(self.device) # (B,)
-        lang_ids = batch["lang_ids"].to(self.device)       # (B,)
-        mask = batch["mask"].to(self.device)               # (B, T) padding
+        mel = batch["mel"].to(self.device)                # (B, T, mel_dim) channels LAST
+        text_ids = batch["text_ids"].to(self.device)       # (B, L)
+        mel_lengths = batch["mel_lengths"].to(self.device)  # (B,)
+        lang_ids = batch["lang_ids"].to(self.device)        # (B,)
+        mask = batch["mask"].to(self.device)                # (B, T) padding
         audio_paths = batch["audio_paths"]
 
         B, T, D = mel.shape
@@ -431,33 +402,38 @@ class Trainer:
         # 1. Emotion embeddings (cached → <1ms)
         emotion_emb = self._extract_emotion_batch(audio_paths)
 
-        # 2. Random span mask: which frames to GENERATE
-        gen_mask = random_span_mask(mel_lengths, T, mask_ratio_range=(0.7, 1.0))
-        gen_mask = gen_mask.to(self.device)
+        # 2. Random span masking: gen_mask True = generate, False = condition
+        gen_mask = random_span_mask(mel_lengths, T).to(self.device)
 
-        # 3. Condition mel: unmask = reference, mask = zeros
+        # 3. Condition mel: keep reference, zero out generation region
         cond = mel.clone()
-        cond[gen_mask] = 0.0                              # zero out generated region
+        cond[gen_mask] = 0.0
 
         # 4. Flow matching
-        x_0 = torch.randn_like(mel)                       # noise (B, T, D)
-        t = self.flow.sample_timesteps(B, self.device)     # (B,)
-        x_t, v_target = self.flow.interpolate(x_0, mel, t) # (B, T, D) each
+        x_0 = torch.randn_like(mel)
+        t = self.flow.sample_timesteps(B, self.device)
+        x_t, v_target = self.flow.interpolate(x_0, mel, t)
 
-        # 5. Forward (hooks fire inside dit.forward)
+        # 5. CFG dropout (match F5-TTS training)
+        drop_audio = random.random() < self.audio_drop_prob
+        drop_text = random.random() < self.cond_drop_prob
+
+        # 6. Forward — hooks fire inside DiT
         with torch.amp.autocast("cuda", dtype=self._amp_dtype(), enabled=self._use_amp()):
-            v_pred = self.enhanced(
+            v_pred = self.enhanced.predict_velocity(
                 x=x_t,
                 cond=cond,
                 text=text_ids,
                 time=t,
-                mask=mask,               # padding mask
+                mask=mask,
+                drop_audio_cond=drop_audio,
+                drop_text=drop_text,
                 emotion_emb=emotion_emb,
                 lang_id=lang_ids,
             )
 
-            # 6. Loss only on GENERATED (masked) AND non-padded frames
-            loss_mask = gen_mask & mask   # (B, T)
+            # 7. Loss on GENERATED region only (not reference, not padding)
+            loss_mask = gen_mask & mask
             loss = self.flow.compute_loss(v_pred, v_target, loss_mask)
 
         return {"loss": loss, "batch_size": B}
@@ -492,8 +468,9 @@ class Trainer:
             x_t, v_target = self.flow.interpolate(x_0, mel, t)
 
             with torch.amp.autocast("cuda", dtype=self._amp_dtype(), enabled=self._use_amp()):
-                v_pred = self.enhanced(x_t, cond, text_ids, t, mask=mask,
-                                       emotion_emb=emo, lang_id=lang_ids)
+                v_pred = self.enhanced.predict_velocity(
+                    x_t, cond, text_ids, t, mask=mask,
+                    emotion_emb=emo, lang_id=lang_ids)
                 loss_mask = gen_mask & mask
                 loss = self.flow.compute_loss(v_pred, v_target, loss_mask)
 
@@ -512,6 +489,7 @@ class Trainer:
         path = self.save_dir / tag
         path.mkdir(parents=True, exist_ok=True)
 
+        # Save adapter params only (~15-20 MB)
         torch.save(self.enhanced.get_adapter_state_dict(), str(path / "adapters.pt"))
         torch.save({
             "optimizer": self.optimizer.state_dict(),
@@ -523,6 +501,7 @@ class Trainer:
         }, str(path / "trainer_state.pt"))
         print(f"[Checkpoint] → {path}")
 
+        # Cleanup old checkpoints
         keep = self.config.get("checkpoint", {}).get("keep_last_n", 3)
         ckpts = sorted(
             [d for d in self.save_dir.iterdir()
@@ -538,30 +517,30 @@ class Trainer:
             print(f"[Resume] Not found: {path}")
             return
 
+        # Load adapter weights
         ap = path / "adapters.pt"
         if ap.exists():
-            state = torch.load(str(ap), map_location="cpu")
+            state = torch.load(str(ap), map_location=self.device)
             self.enhanced.load_adapter_state_dict(state)
 
+        # Load trainer state
         sp = path / "trainer_state.pt"
         if sp.exists():
             s = torch.load(str(sp), map_location="cpu")
             self.optimizer.load_state_dict(s["optimizer"])
             self.scheduler.load_state_dict(s["scheduler"])
             if "ema" in s:
-                self.ema.load_state_dict(s["ema"])
+                self.ema.load_state_dict(s["ema"], device=self.device)  # ← device-safe
             self.global_step = s.get("global_step", 0)
             self.epoch = s.get("epoch", 0)
             self.best_loss = s.get("best_loss", float("inf"))
             print(f"[Resume] step={self.global_step}, epoch={self.epoch}")
 
-    # ─── Logging ──────────────────────────────────────────────────────
+    # ─── Logging / Summary ────────────────────────────────────────────
 
     def _log(self, tag, val, step):
-        if self.writer and hasattr(self.writer, "add_scalar"):
+        if self.writer:
             self.writer.add_scalar(tag, val, step)
-
-    # ─── Summary ──────────────────────────────────────────────────────
 
     def _print_summary(self):
         cfg = self.config.get("optim", {})
@@ -569,11 +548,12 @@ class Trainer:
         trainable = sum(p.numel() for p in self.enhanced.parameters() if p.requires_grad)
         print(f"\n{'='*60}")
         print(f"  Total:      {total:>12,}")
-        print(f"  Trainable:  {trainable:>12,}  ({100*trainable/total:.2f}%)")
+        print(f"  Trainable:  {trainable:>12,}  ({100*trainable/max(total,1):.2f}%)")
         print(f"  Max steps:  {cfg.get('max_steps', 150000):>12,}")
         print(f"  LR:         {cfg.get('learning_rate', 1e-5):>12}")
         print(f"  Grad accum: {cfg.get('grad_accumulation_steps', 4):>12}")
         print(f"  AMP:        {cfg.get('mixed_precision', 'bf16'):>12}")
+        print(f"  CFG drop:   audio={self.audio_drop_prob}  text={self.cond_drop_prob}")
         print(f"  Step:       {self.global_step:>12}")
         print(f"  Batches:    {len(self.train_loader):>12}")
         print(f"  Device:     {self.device}")
@@ -594,7 +574,6 @@ class Trainer:
         save_every = ckpt_cfg.get("save_per_updates", 5000)
         last_every = ckpt_cfg.get("last_per_steps", 1000)
         log_every = log_cfg.get("log_every_steps", 100)
-        eval_every = self.config.get("evaluation", {}).get("eval_every_steps", 5000)
 
         acc_loss, acc_n = 0.0, 0
         t0 = time.time()
@@ -621,8 +600,7 @@ class Trainer:
                     self.scaler.unscale_(self.optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         [p for p in self.enhanced.parameters() if p.requires_grad],
-                        max_grad_norm,
-                    )
+                        max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
@@ -634,13 +612,14 @@ class Trainer:
 
                     if self.global_step % log_every == 0:
                         elapsed = time.time() - t0
-                        sps = log_every / elapsed
+                        sps = log_every / max(elapsed, 0.01)
                         lr = self.scheduler.get_last_lr()[0]
+                        gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
                         print(f"[{self.global_step:>7}] loss={avg:.4f}  "
-                              f"grad={grad_norm:.3f}  lr={lr:.2e}  "
+                              f"grad={gn:.3f}  lr={lr:.2e}  "
                               f"speed={sps:.1f}it/s  ep={epoch}")
                         self._log("train/loss", avg, self.global_step)
-                        self._log("train/grad_norm", grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, self.global_step)
+                        self._log("train/grad_norm", gn, self.global_step)
                         self._log("train/lr", lr, self.global_step)
                         t0 = time.time()
 
@@ -665,8 +644,7 @@ class Trainer:
         self.save_checkpoint("final")
         val = self.validate()
         print(f"\n[Done] val={val:.4f}  best={self.best_loss:.4f}")
-        print(f"[Done] Checkpoints: {self.save_dir}")
-        if self.writer and hasattr(self.writer, "close"):
+        if self.writer:
             self.writer.close()
 
 
@@ -676,14 +654,15 @@ class Trainer:
 
 def export_for_inference(ckpt_dir, output):
     ckpt_dir = Path(ckpt_dir)
-    adapters = torch.load(str(ckpt_dir / "adapters.pt"), map_location="cpu")
+    adapters = torch.load(str(ckpt_dir / "adapters.pt"), map_location="cpu",
+                          weights_only=True)
     n = sum(v.numel() for v in adapters.values())
     mb = sum(v.element_size() * v.numel() for v in adapters.values()) / 1024 / 1024
 
     meta = {}
     sp = ckpt_dir / "trainer_state.pt"
     if sp.exists():
-        s = torch.load(str(sp), map_location="cpu")
+        s = torch.load(str(sp), map_location="cpu", weights_only=True)
         meta = {k: s.get(k) for k in ("global_step", "best_loss") if k in s}
 
     torch.save({"adapters": adapters, "metadata": meta}, output)
@@ -695,7 +674,7 @@ def export_for_inference(ckpt_dir, output):
 # =========================================================================
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="F5-TTS Enhanced Training")
     p.add_argument("--config", default="configs/finetune_crosslang_emotion.yaml")
     p.add_argument("--resume", default=None)
     p.add_argument("--export", default=None)

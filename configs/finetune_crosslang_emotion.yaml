@@ -12,8 +12,8 @@
 # --- Базовая модель ---
 base_model:
   name: F5TTS_v1_Base
-  checkpoint: "https://huggingface.co/ESpeech/ESpeech-TTS-1_RL-V2/resolve/main/espeech_tts_rlv2.pt"
-  vocab: "https://huggingface.co/ESpeech/ESpeech-TTS-1_RL-V2/resolve/main/vocab.txt"
+  checkpoint: "hf://ESpeech/ESpeech-TTS-1_RL-V2/espeech_tts_rlv2.pt"
+  vocab: "hf://ESpeech/ESpeech-TTS-1_RL-V2/vocab.txt"
   # Если нужен multilingual vocab — укажите свой путь:
   # vocab: "./vocab_multilingual.txt"
 

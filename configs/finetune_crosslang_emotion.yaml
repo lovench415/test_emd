@@ -91,9 +91,9 @@ adapters:
 # --- Данные для файнтюнинга ---
 datasets:
   # Путь к подготовленным данным (выход prepare_multilingual_dataset.py)
-  data_root: "/data/prepared"                # корневая директория
-  metadata_train: "/data/prepared/metadata.csv"
-  metadata_val: "/data/prepared/metadata_val.csv"
+  data_root: "/kaggle/working/F5-TTS/data/prepared"                # корневая директория
+  metadata_train: "/kaggle/working/F5-TTS/data/prepared/metadata.csv"
+  metadata_val: "/kaggle/working/F5-TTS/data/prepared/metadata_val.csv"
 
   # Или список исходных директорий (для prepare_multilingual_dataset.py):
   multilingual:

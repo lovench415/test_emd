@@ -163,18 +163,18 @@ evaluation:
   
   # Reference аудио для генерации samples
   eval_refs:
-    - audio: "eval/ref_en_neutral.wav"
-      text: "Some call me nature, others call me mother nature."
-      gen_text: "I don't care what you call me, I've been watching species evolve."
-      gen_lang: en
-    - audio: "eval/ref_en_happy.wav"
-      text: "This is absolutely wonderful news!"
-      gen_text: "Это замечательная новость, я очень рада!"
-      gen_lang: ru
-    - audio: "eval/ref_zh.wav"
-      text: "对，这就是我，万人敬仰的太乙真人。"
-      gen_text: "Yes, that's me, the greatly admired immortal."
-      gen_lang: en
+    #- audio: "eval/ref_en_neutral.wav"
+     # text: "Some call me nature, others call me mother nature."
+      #gen_text: "I don't care what you call me, I've been watching species evolve."
+      #gen_lang: en
+    #- audio: "eval/ref_en_happy.wav"
+     # text: "This is absolutely wonderful news!"
+      #gen_text: "Это замечательная новость, я очень рада!"
+      #gen_lang: ru
+   # - audio: "eval/ref_zh.wav"
+    #  text: "对，这就是我，万人敬仰的太乙真人。"
+     # gen_text: "Yes, that's me, the greatly admired immortal."
+     # gen_lang: en
   
   metrics:
     - WER          # Word Error Rate (Whisper transcription)

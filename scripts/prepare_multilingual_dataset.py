@@ -94,9 +94,9 @@ def scan_dataset_with_metadata(
     """
     data_dir = Path(data_dir)
     samples = []
-
+    #["metadata.csv", "metadata.txt", "metadata.list", "transcript.txt", "manifest.jsonl"]
     # Ищем metadata файлы
-    for meta_name in ["metadata.csv", "metadata.txt", "metadata.list", "transcript.txt", "manifest.jsonl"]:
+    for meta_name in ["manifest.jsonl"]:
         meta_path = data_dir / meta_name
         print(meta_path)
         #if os.path.exists(meta_path):

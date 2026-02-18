@@ -32,7 +32,6 @@ Integration strategy:
 import torch
 import torch.nn as nn
 from typing import Optional
-from functools import wraps
 
 from .adapters import (
     ConditioningAdapter,
@@ -83,7 +82,7 @@ class EnhancedF5TTS(nn.Module):
         self.text_dim = text_dim
 
         # Получаем DiT внутри CFM
-        self.dit = cfm_model.dim
+        self.dit = cfm_model.transformer
 
         # Заморозить всю базовую модель
         if freeze_base:
@@ -138,6 +137,9 @@ class EnhancedF5TTS(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        # Near-zero init → starts as no-op, prevents disrupting pretrained weights
+        nn.init.zeros_(self.emotion_to_timestep[-1].weight)
+        nn.init.zeros_(self.emotion_to_timestep[-1].bias)
 
         # Runtime state (set per forward, read by hooks)
         self._current_emotion_emb = None   # (B, emotion_dim)
@@ -243,10 +245,44 @@ class EnhancedF5TTS(nn.Module):
         if not hasattr(self.dit, "text_embed"):
             return
         text_embed = self.dit.text_embed
-        if not hasattr(text_embed, "text_blocks"):
+
+        # F5-TTS stores ConvNeXt blocks under various attribute names
+        blocks = None
+        for attr in ("text_blocks", "extra", "conv_blocks", "convnext"):
+            if hasattr(text_embed, attr):
+                candidate = getattr(text_embed, attr)
+                if isinstance(candidate, (nn.ModuleList, nn.Sequential)):
+                    blocks = list(candidate)
+                    break
+
+        # Fallback: scan children for ConvNeXt-like blocks
+        if blocks is None:
+            blocks = [
+                m for m in text_embed.children()
+                if isinstance(m, (nn.ModuleList, nn.Sequential))
+            ]
+            if blocks:
+                # Take the first ModuleList/Sequential, assume it's the ConvNeXt stack
+                blocks = list(blocks[0]) if hasattr(blocks[0], '__iter__') else []
+
+        if not blocks:
+            print("[EnhancedF5TTS] WARNING: No ConvNeXt blocks found in text_embed. "
+                  "Conditioning adapters will apply as post-hook on text_embed instead.")
+            # Fallback: apply ALL adapters as one post-hook on text_embed output
+            adapters = self.cond_adapters
+
+            def fallback_hook(module, input, output):
+                if output.dim() == 3:
+                    h = output.transpose(1, 2)
+                    for adpt in adapters:
+                        h = adpt(h)
+                    return h.transpose(1, 2)
+                return output
+
+            h = text_embed.register_forward_hook(fallback_hook)
+            self._hooks.append(h)
             return
 
-        blocks = list(text_embed.text_blocks)
         for i, block in enumerate(blocks):
             if i >= len(self.cond_adapters):
                 break
@@ -351,6 +387,66 @@ class EnhancedF5TTS(nn.Module):
         self._current_emotion_emb = None
         self._current_emotion_bias = None
         self._current_lang_id = None
+
+    # ================================================================
+    # Direct DiT call (for manual flow matching in training)
+    # ================================================================
+
+    def predict_velocity(
+        self,
+        x: torch.Tensor,           # noisy mel (B, N, mel_dim) — channels LAST
+        cond: torch.Tensor,         # condition mel (B, N, mel_dim)
+        text: torch.Tensor,         # text tokens (B, nt)
+        time: torch.Tensor,         # timestep (B,)
+        mask: torch.Tensor = None,  # padding mask (B, N)
+        drop_audio_cond: bool = False,
+        drop_text: bool = False,
+        emotion_emb: torch.Tensor = None,
+        lang_id: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Вызывает DiT.forward() напрямую (минуя CFM).
+        Hooks активны — адаптеры инжектируются.
+
+        Для использования в собственном flow matching training loop.
+        Returns: velocity prediction (B, N, mel_dim)
+        """
+        self._set_context(emotion_emb, lang_id)
+        try:
+            v_pred = self.dit(
+                x, cond, text, time,
+                drop_audio_cond=drop_audio_cond,
+                drop_text=drop_text,
+                mask=mask,
+            )
+        finally:
+            self._clear_context()
+        return v_pred
+
+    # ================================================================
+    # Save / Load adapters
+    # ================================================================
+
+    def get_adapter_state_dict(self) -> dict:
+        """Только trainable (adapter) параметры для сохранения."""
+        return {
+            name: param.data.clone()
+            for name, param in self.named_parameters()
+            if param.requires_grad
+        }
+
+    def load_adapter_state_dict(self, state_dict: dict, strict: bool = False):
+        """Загрузить adapter-параметры."""
+        own_state = dict(self.named_parameters())
+        loaded, skipped = 0, 0
+        for name, param in state_dict.items():
+            if name in own_state and own_state[name].requires_grad:
+                own_state[name].data.copy_(param)
+                loaded += 1
+            else:
+                skipped += 1
+        print(f"[EnhancedF5TTS] Loaded {loaded}/{len(state_dict)} adapter params"
+              f"{f' (skipped {skipped})' if skipped else ''}")
 
 
 # =========================================================================

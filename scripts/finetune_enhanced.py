@@ -300,7 +300,7 @@ class Trainer:
             add_language_emb=adapter_cfg.get("language_embedding", {}).get("enabled", True),
             freeze_base=adapter_cfg.get("freeze_base", True),
         )
-        enhanced.register_lora_hooks()
+        enhanced._install_lora_hooks()
         enhanced = enhanced.to(self.device)
 
         return cfm, enhanced

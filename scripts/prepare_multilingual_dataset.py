@@ -108,7 +108,7 @@ def scan_dataset_with_metadata(
                 if not line or line.startswith("#"):
                     continue
                 if "manifest.jsonl" in meta_name:
-                    print(meta_name)
+                    #print(meta_name)
                     record = json.loads(line)
                     audio_file = record["audio_path"].strip()
                     text = record["text"].strip()

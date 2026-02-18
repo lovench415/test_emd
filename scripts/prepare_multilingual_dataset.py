@@ -98,13 +98,16 @@ def scan_dataset_with_metadata(
     # Ищем metadata файлы
     for meta_name in ["metadata.csv", "metadata.txt", "metadata.list", "transcript.txt", "manifest.jsonl"]:
         meta_path = data_dir / meta_name
+        print(meta_path)
         if meta_path.exists():
+            print("meta_path exist")
             with open(meta_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
                     if "manifest.jsonl" in meta_name:
+                        print(meta_name)
                         record = json.loads(line)
                         audio_file = record["audio_path"].strip()
                         text = record["text"].strip()

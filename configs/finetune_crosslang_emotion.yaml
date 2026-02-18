@@ -111,7 +111,7 @@ datasets:
   #   wavs/en_000001.wav|Hello world|en|2.5|happy
   #   wavs/ru_000001.wav|Привет мир|ru|2.3|
   
-  batch_size_per_gpu: 3200    # в Mel-фреймах (динамический батчинг)
+  batch_size_per_gpu: 2000    # в Mel-фреймах (динамический батчинг)
   batch_size_type: frame
   max_samples: 64             # макс сэмплов в батче
   num_workers: 4

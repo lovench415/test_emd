@@ -290,7 +290,7 @@ class Trainer:
         emo_ext = emo_cfg.get("extractor", {})
 
         enhanced = EnhancedF5TTS(
-            dit_model=cfm.transformer,
+            cfm_model=cfm.transformer,
             emotion_dim=emo_ext.get("emotion_dim", 768),
             emotion_mode=emo_cfg.get("conditioning", {}).get("mode", "adaln"),
             lora_rank=lora_cfg.get("rank", 16),

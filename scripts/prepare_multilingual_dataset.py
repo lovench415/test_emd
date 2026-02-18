@@ -99,43 +99,43 @@ def scan_dataset_with_metadata(
     for meta_name in ["metadata.csv", "metadata.txt", "metadata.list", "transcript.txt", "manifest.jsonl"]:
         meta_path = data_dir / meta_name
         print(meta_path)
-        if os.path.exists(meta_path):
-            print("meta_path exist")
-            with open(meta_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "manifest.jsonl" in meta_name:
-                        print(meta_name)
-                        record = json.loads(line)
-                        audio_file = record["audio_path"].strip()
-                        text = record["text"].strip()
+        #if os.path.exists(meta_path):
+        print("meta_path exist")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "manifest.jsonl" in meta_name:
+                    print(meta_name)
+                    record = json.loads(line)
+                    audio_file = record["audio_path"].strip()
+                    text = record["text"].strip()
+                    audio_path = data_dir / audio_file
+                    lang = record["language"]
+                    samples.append({
+                        "audio_path": str(audio_path),
+                        "text": text,
+                        "language": lang,
+                    })
+                else:
+                    parts = line.split("|")
+                    if len(parts) >= 2:
+                        audio_file = parts[0].strip()
+                        text = parts[1].strip()
+
+                        # Resolve path
                         audio_path = data_dir / audio_file
-                        lang = record["language"]
+                        if not audio_path.suffix:
+                            audio_path = audio_path.with_suffix(".wav")
+
+                        lang = language if language != "auto" else detect_language(text)
+
                         samples.append({
                             "audio_path": str(audio_path),
                             "text": text,
                             "language": lang,
                         })
-                    else:
-                        parts = line.split("|")
-                        if len(parts) >= 2:
-                            audio_file = parts[0].strip()
-                            text = parts[1].strip()
-
-                            # Resolve path
-                            audio_path = data_dir / audio_file
-                            if not audio_path.suffix:
-                                audio_path = audio_path.with_suffix(".wav")
-
-                            lang = language if language != "auto" else detect_language(text)
-
-                            samples.append({
-                                "audio_path": str(audio_path),
-                                "text": text,
-                                "language": lang,
-                            })
             break
 
     # Fallback: .wav + .txt пары

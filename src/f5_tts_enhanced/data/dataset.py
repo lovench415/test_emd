@@ -3,14 +3,16 @@ Multilingual Emotion TTS Dataset
 ==================================
 Dataset и DataLoader для файнтюнинга F5-TTS Enhanced.
 
-КРИТИЧНО: mel выходит в формате (T, mel_dim) = channels LAST,
-чтобы совпадать с F5-TTS DiT: x shape (B, N, mel_dim).
-
 Формат metadata.csv (pipe-separated):
     audio_path|text|language|duration|emotion
     wavs/en_000001.wav|Hello world|en|2.5|happy
+    wavs/ru_000001.wav|Привет мир|ru|2.3|
+
+Батчинг: по суммарному числу mel-фреймов (frame-based dynamic batching),
+как в оригинальном F5-TTS.
 """
 
+import csv
 import math
 import os
 import random
@@ -22,9 +24,11 @@ import torch
 import torchaudio
 from torch.utils.data import Dataset, Sampler, DataLoader
 
+from f5_tts_enhanced.data.multilingual_vocab import detect_language
+
 
 # =========================================================================
-# Language map (matches adapters.py LanguageEmbedding)
+# Language map (must match adapters.py LanguageEmbedding)
 # =========================================================================
 
 LANG2ID = {
@@ -39,10 +43,15 @@ def lang_to_id(lang: str) -> int:
 
 
 # =========================================================================
-# Mel Spectrogram (matching F5-TTS / Vocos)
+# Mel Spectrogram (matching F5-TTS)
 # =========================================================================
 
 class MelSpectrogramExtractor:
+    """
+    Mel spectrogram compatible with F5-TTS / Vocos.
+    Использует torchaudio для извлечения.
+    """
+
     def __init__(
         self,
         sample_rate: int = 24000,
@@ -50,16 +59,21 @@ class MelSpectrogramExtractor:
         hop_length: int = 256,
         win_length: int = 1024,
         n_mels: int = 100,
+        f_min: float = 0.0,
+        f_max: float = None,
     ):
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.n_mels = n_mels
+
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
             hop_length=hop_length,
             win_length=win_length,
             n_mels=n_mels,
+            f_min=f_min,
+            f_max=f_max or sample_rate // 2,
             power=1.0,
             norm="slaney",
             mel_scale="slaney",
@@ -70,13 +84,13 @@ class MelSpectrogramExtractor:
         Args:
             audio: (1, samples) or (samples,)
         Returns:
-            mel: (T, n_mels) — channels LAST (matching F5-TTS DiT)
+            mel: (n_mels, T)
         """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         mel = self.mel_transform(audio).squeeze(0)  # (n_mels, T)
+        # Log mel
         mel = torch.log(torch.clamp(mel, min=1e-5))
-        mel = mel.transpose(0, 1)  # → (T, n_mels) channels LAST
         return mel
 
 
@@ -86,12 +100,13 @@ class MelSpectrogramExtractor:
 
 class TTSDataset(Dataset):
     """
-    Возвращает:
-        mel:        (T, n_mels)   — channels LAST
-        text_ids:   list[int]
-        lang_id:    int
-        audio_path: str           — для emotion2vec
-        mel_frames: int
+    Dataset для мультиязычного эмоционального TTS.
+
+    Читает metadata.csv и загружает:
+    - mel спектрограмму (для flow matching)
+    - текст (в виде list[int] token ids)
+    - язык (int)
+    - путь к оригинальному аудио (для emotion extraction через emotion2vec)
     """
 
     def __init__(
@@ -107,30 +122,40 @@ class TTSDataset(Dataset):
     ):
         self.data_root = Path(data_root)
         self.target_sr = target_sr
-        self.hop_length = hop_length
         self.max_frames = int(max_duration * target_sr / hop_length)
         self.min_frames = int(min_duration * target_sr / hop_length)
 
+        # Mel extractor
         self.mel_extractor = MelSpectrogramExtractor(
-            sample_rate=target_sr, n_mels=n_mels, hop_length=hop_length,
+            sample_rate=target_sr,
+            n_mels=n_mels,
+            hop_length=hop_length,
         )
+
+        # Vocab (char → id)
         self.vocab = self._load_vocab(vocab_path)
-        self.pad_id = self.vocab.get("<pad>", 0)
+
+        # Load metadata
         self.samples = self._load_metadata(metadata_path)
-        print(f"[Dataset] {len(self.samples)} samples from {metadata_path}")
+        print(f"[Dataset] Loaded {len(self.samples)} samples from {metadata_path}")
 
     def _load_vocab(self, path: str) -> dict:
+        """Load vocab.txt → {char: id}."""
         vocab = {}
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 char = line.strip()
                 if char:
                     vocab[char] = len(vocab)
-        vocab.setdefault("<pad>", len(vocab))
-        vocab.setdefault("<unk>", len(vocab))
+        # Special tokens
+        if "<pad>" not in vocab:
+            vocab["<pad>"] = len(vocab)
+        if "<unk>" not in vocab:
+            vocab["<unk>"] = len(vocab)
         return vocab
 
     def _load_metadata(self, path: str) -> list:
+        """Load metadata.csv (pipe-separated)."""
         samples = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -146,29 +171,32 @@ class TTSDataset(Dataset):
                 language = parts[2].strip()
                 duration = float(parts[3].strip()) if len(parts) > 3 and parts[3].strip() else 0.0
 
-                full_path = str(self.data_root / audio_path)
-                if not os.path.exists(full_path):
+                # Полный путь
+                full_audio_path = str(self.data_root / audio_path)
+                if not os.path.exists(full_audio_path):
                     continue
 
-                mel_frames = int(duration * self.target_sr / self.hop_length)
-                if self.max_frames and mel_frames > self.max_frames:
-                    continue
-                if mel_frames < self.min_frames:
+                # Duration в фреймах
+                mel_frames = int(duration * self.target_sr / self.mel_extractor.hop_length)
+                if mel_frames > self.max_frames or mel_frames < self.min_frames:
                     continue
 
                 samples.append({
-                    "audio_path": full_path,
+                    "audio_path": full_audio_path,
                     "text": text,
                     "language": language,
+                    "duration": duration,
                     "mel_frames": mel_frames,
                 })
 
+        # Сортировка по длительности (для эффективного батчинга)
         samples.sort(key=lambda x: x["mel_frames"])
         return samples
 
     def text_to_ids(self, text: str) -> list:
-        unk = self.vocab.get("<unk>", 0)
-        return [self.vocab.get(c, unk) for c in text]
+        """Символьная токенизация (как в F5-TTS)."""
+        unk_id = self.vocab.get("<unk>", 0)
+        return [self.vocab.get(c, unk_id) for c in text]
 
     def __len__(self):
         return len(self.samples)
@@ -176,38 +204,55 @@ class TTSDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
 
+        # Load audio
         audio, sr = torchaudio.load(sample["audio_path"])
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
         if sr != self.target_sr:
             audio = torchaudio.functional.resample(audio, sr, self.target_sr)
 
-        mel = self.mel_extractor(audio)  # (T, n_mels) channels LAST
+        # Mel spectrogram
+        mel = self.mel_extractor(audio)  # (n_mels, T)
+
+        # Text
         text_ids = self.text_to_ids(sample["text"])
+
+        # Language
         lang_id = lang_to_id(sample["language"])
 
         return {
-            "mel": mel,                           # (T, n_mels) channels LAST
-            "text_ids": text_ids,
-            "lang_id": lang_id,
-            "audio_path": sample["audio_path"],
-            "mel_frames": mel.shape[0],           # T
-            "text_len": len(text_ids),
+            "mel": mel,                           # (n_mels, T)
+            "text_ids": text_ids,                  # list[int]
+            "lang_id": lang_id,                    # int
+            "audio_path": sample["audio_path"],    # str — для emotion2vec
+            "mel_frames": mel.shape[1],            # int
+            "text_len": len(text_ids),             # int
         }
 
 
 # =========================================================================
-# Frame-Based Dynamic Batch Sampler
+# Frame-Based Dynamic Batch Sampler (как в F5-TTS)
 # =========================================================================
 
 class FrameBatchSampler(Sampler):
-    """Формирует батчи по суммарному числу mel-фреймов."""
+    """
+    Формирует батчи по суммарному числу mel-фреймов.
+
+    Вместо фиксированного batch_size, каждый батч содержит ≤ max_frames фреймов.
+    Это означает:
+    - Короткие utterance'ы → больше в батче
+    - Длинные utterance'ы → меньше в батче
+    - VRAM usage более-менее постоянный
+
+    Использует bucket-based подход: сортирует по длительности,
+    формирует bucket'ы из соседних сэмплов, шаффлит bucket'ы.
+    """
 
     def __init__(
         self,
         dataset: TTSDataset,
-        max_frames: int = 3200,
-        max_samples: int = 64,
+        max_frames: int = 3200,      # макс. суммарных фреймов в батче
+        max_samples: int = 64,        # макс. сэмплов в батче
         shuffle: bool = True,
         seed: int = 42,
         drop_last: bool = True,
@@ -219,29 +264,44 @@ class FrameBatchSampler(Sampler):
         self.drop_last = drop_last
         self.epoch = 0
         self.seed = seed
+
+        # Precompute batches
         self._batches = self._build_batches()
 
     def _build_batches(self) -> list:
+        """Собрать батчи из индексов."""
+        # Индексы уже отсортированы по mel_frames в dataset
         indices = list(range(len(self.dataset)))
+
         batches = []
-        batch, frames = [], 0
+        current_batch = []
+        current_frames = 0
+
         for idx in indices:
-            sf = self.dataset.samples[idx]["mel_frames"]
-            if (frames + sf > self.max_frames
-                    or len(batch) >= self.max_samples) and batch:
-                batches.append(batch)
-                batch, frames = [], 0
-            batch.append(idx)
-            frames += sf
-        if batch and not self.drop_last:
-            batches.append(batch)
+            sample_frames = self.dataset.samples[idx]["mel_frames"]
+
+            # Если добавление сэмпла превысит лимит — начать новый батч
+            if (current_frames + sample_frames > self.max_frames
+                    or len(current_batch) >= self.max_samples) and current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_frames = 0
+
+            current_batch.append(idx)
+            current_frames += sample_frames
+
+        if current_batch and not self.drop_last:
+            batches.append(current_batch)
+
         return batches
 
     def __iter__(self):
         batches = self._batches.copy()
         if self.shuffle:
-            random.Random(self.seed + self.epoch).shuffle(batches)
-        yield from batches
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(batches)
+        for batch in batches:
+            yield batch
         self.epoch += 1
 
     def __len__(self):
@@ -252,57 +312,64 @@ class FrameBatchSampler(Sampler):
 
 
 # =========================================================================
-# Collate — all tensors channels LAST
+# Collate Function
 # =========================================================================
 
 def collate_fn(batch: list) -> dict:
     """
-    Returns:
-        mel:         (B, T_max, n_mels)  — channels LAST
-        mel_lengths: (B,)
-        text_ids:    (B, L_max)
-        text_lengths:(B,)
-        lang_ids:    (B,)
+    Collate с padding по максимальной длине в батче.
+
+    Returns dict:
+        mel: (B, n_mels, T_max) — padded mel
+        mel_lengths: (B,) — реальные длины
+        text_ids: (B, L_max) — padded text
+        text_lengths: (B,) — реальные длины текста
+        lang_ids: (B,)
         audio_paths: list[str]
-        mask:        (B, T_max)  — True for valid frames
+        mask: (B, T_max) — True для реальных фреймов
     """
-    n_mels = batch[0]["mel"].shape[1]
-    max_mel = max(item["mel_frames"] for item in batch)
-    max_txt = max(item["text_len"] for item in batch)
+    n_mels = batch[0]["mel"].shape[0]
+
+    # Max lengths
+    max_mel_len = max(item["mel_frames"] for item in batch)
+    max_text_len = max(item["text_len"] for item in batch)
     B = len(batch)
 
-    mel_padded = torch.zeros(B, max_mel, n_mels)          # channels LAST
-    text_padded = torch.zeros(B, max_txt, dtype=torch.long)
+    # Allocate tensors
+    mel_padded = torch.zeros(B, n_mels, max_mel_len)
+    text_padded = torch.zeros(B, max_text_len, dtype=torch.long)
     mel_lengths = torch.zeros(B, dtype=torch.long)
     text_lengths = torch.zeros(B, dtype=torch.long)
     lang_ids = torch.zeros(B, dtype=torch.long)
     audio_paths = []
 
     for i, item in enumerate(batch):
-        ml = item["mel"].shape[0]
-        tl = item["text_len"]
-        mel_padded[i, :ml, :] = item["mel"]
-        text_padded[i, :tl] = torch.tensor(item["text_ids"], dtype=torch.long)
-        mel_lengths[i] = ml
-        text_lengths[i] = tl
+        mel_len = item["mel"].shape[1]
+        text_len = item["text_len"]
+
+        mel_padded[i, :, :mel_len] = item["mel"]
+        text_padded[i, :text_len] = torch.tensor(item["text_ids"], dtype=torch.long)
+        mel_lengths[i] = mel_len
+        text_lengths[i] = text_len
         lang_ids[i] = item["lang_id"]
         audio_paths.append(item["audio_path"])
 
-    mask = torch.arange(max_mel).unsqueeze(0) < mel_lengths.unsqueeze(1)
+    # Mask: True for valid frames
+    mask = torch.arange(max_mel_len).unsqueeze(0) < mel_lengths.unsqueeze(1)  # (B, T_max)
 
     return {
-        "mel": mel_padded,
-        "mel_lengths": mel_lengths,
-        "text_ids": text_padded,
-        "text_lengths": text_lengths,
-        "lang_ids": lang_ids,
-        "audio_paths": audio_paths,
-        "mask": mask,
+        "mel": mel_padded,              # (B, n_mels, T_max)
+        "mel_lengths": mel_lengths,      # (B,)
+        "text_ids": text_padded,         # (B, L_max)
+        "text_lengths": text_lengths,    # (B,)
+        "lang_ids": lang_ids,            # (B,)
+        "audio_paths": audio_paths,      # list[str]
+        "mask": mask,                    # (B, T_max)
     }
 
 
 # =========================================================================
-# Factory
+# Create DataLoader
 # =========================================================================
 
 def create_dataloader(
@@ -313,21 +380,41 @@ def create_dataloader(
     max_samples_per_batch: int = 64,
     num_workers: int = 4,
     shuffle: bool = True,
-    **dataset_kwargs,
+    target_sr: int = 24000,
+    n_mels: int = 100,
+    hop_length: int = 256,
+    max_duration: float = 30.0,
 ) -> tuple:
+    """
+    Создаёт Dataset + DataLoader с frame-based батчингом.
+
+    Returns:
+        (dataset, dataloader)
+    """
     dataset = TTSDataset(
         metadata_path=metadata_path,
         data_root=data_root,
         vocab_path=vocab_path,
-        **dataset_kwargs,
+        target_sr=target_sr,
+        n_mels=n_mels,
+        hop_length=hop_length,
+        max_duration=max_duration,
     )
+
     sampler = FrameBatchSampler(
-        dataset, max_frames=max_frames_per_batch,
-        max_samples=max_samples_per_batch, shuffle=shuffle,
+        dataset=dataset,
+        max_frames=max_frames_per_batch,
+        max_samples=max_samples_per_batch,
+        shuffle=shuffle,
     )
-    loader = DataLoader(
-        dataset, batch_sampler=sampler, collate_fn=collate_fn,
-        num_workers=num_workers, pin_memory=True,
+
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=True,
         prefetch_factor=2 if num_workers > 0 else None,
     )
-    return dataset, loader
+
+    return dataset, dataloader

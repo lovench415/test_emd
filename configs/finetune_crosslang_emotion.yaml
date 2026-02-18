@@ -128,7 +128,7 @@ optim:
   num_warmup_updates: 2000
   
   # Gradient
-  grad_accumulation_steps: 4   # effective batch = 4 × 3200 = 12800 frames
+  grad_accumulation_steps: 1   # effective batch = 4 × 3200 = 12800 frames
   max_grad_norm: 1.0
   
   # Optimizer
@@ -152,7 +152,7 @@ checkpoint:
   save_dir: "ckpts/enhanced"
   save_per_updates: 5000       # каждые 5K шагов
   last_per_steps: 1000         # last checkpoint каждые 1K
-  keep_last_n: 3               # хранить последние 3 чекпоинта
+  keep_last_n: 2               # хранить последние 3 чекпоинта
   
   # Для resume
   resume_from: null             # путь к чекпоинту для продолжения

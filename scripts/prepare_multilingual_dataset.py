@@ -99,7 +99,7 @@ def scan_dataset_with_metadata(
     for meta_name in ["metadata.csv", "metadata.txt", "metadata.list", "transcript.txt", "manifest.jsonl"]:
         meta_path = data_dir / meta_name
         print(meta_path)
-        if meta_path.exists():
+        if os.path.exists(meta_path):
             print("meta_path exist")
             with open(meta_path, "r", encoding="utf-8") as f:
                 for line in f:

@@ -170,14 +170,14 @@ def prepare_metadata(
     with open(os.path.join(output_dir, "duration.json"), "w") as f:
         json.dump({"duration": durations}, f)
 
-    if args.build_vocab:
-        # Build vocabulary from all texts
-        vocab = _build_vocab([e["text"] for e in valid_entries])
-        vocab_path = os.path.join(output_dir, "vocab.txt")
-        with open(vocab_path, "w", encoding="utf-8") as f:
-            for char in sorted(vocab):
-                f.write(char + "\n")
-        print(f"Vocabulary: {len(vocab)} characters → {vocab_path}")
+    
+    # Build vocabulary from all texts
+    vocab = _build_vocab([e["text"] for e in valid_entries])
+    vocab_path = os.path.join(output_dir, "vocab.txt")
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        for char in sorted(vocab):
+            f.write(char + "\n")
+    print(f"Vocabulary: {len(vocab)} characters → {vocab_path}")
     
     # Save full metadata
     stats = {

@@ -45,7 +45,7 @@ emotion:
     # Используем предобученную emotion2vec+ (ACL 2024)
     # Обучена на 42K+ часов эмоциональных данных, 10+ языков
     model_size: large          # "large" (300M, лучшее) | "base" (90M) | "seed" (90M)
-    emotion_dim: 768           # нативная размерность emotion2vec
+    emotion_dim: 1024           # нативная размерность emotion2vec
     hub: hf                    # "hf" (HuggingFace) | "ms" (ModelScope для Китая)
     cache_dir: null            # null = ~/.cache/f5tts_emotion_cache
     # pip install funasr       — единственная зависимость

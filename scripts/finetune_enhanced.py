@@ -161,6 +161,19 @@ class Trainer:
 
         self.enhanced = self._build_model()
         self.emotion_extractor = self._build_emotion_extractor()
+
+        # Validate emotion dimensions match
+        actual_emo_dim = self._probe_emotion_dim()
+        expected_emo_dim = self.enhanced.emotion_to_timestep[0].in_features
+        if actual_emo_dim != expected_emo_dim:
+            print(f"[Trainer] FIXING emotion dim mismatch: "
+                  f"extractor outputs {actual_emo_dim}, "
+                  f"model expects {expected_emo_dim}")
+            self.enhanced.emotion_to_timestep = (
+                EnhancedF5TTS._build_emotion_proj(actual_emo_dim, self.enhanced.hidden_dim)
+                .to(self.device)
+            )
+
         self.flow = FlowMatchingScheduler(sigma=0.0)
         self.train_loader, self.val_loader = self._build_dataloaders()
         self.optimizer, self.scheduler = self._build_optimizer()
@@ -186,7 +199,6 @@ class Trainer:
         base_cfg = self.config.get("base_model", {})
         model_cfg = self.config.get("model", {}).get("arch", {})
         adapter_cfg = self.config.get("adapters", {})
-        emo_cfg = self.config.get("emotion", {})
         mel_cfg = self.config.get("model", {}).get("mel_spec", {})
 
         try:
@@ -261,12 +273,15 @@ class Trainer:
 
         # Wrap CFM with EnhancedF5TTS (pass entire CFM, not just DiT!)
         lora_cfg = adapter_cfg.get("lora", {})
-        emo_ext = emo_cfg.get("extractor", {})
+        # Read emotion_dim from SAME config path as _build_emotion_extractor
+        emotion_dim = self.config.get("emotion", {}).get("extractor", {}).get("emotion_dim", 768)
+        emotion_mode = self.config.get("emotion", {}).get("conditioning", {}).get("mode", "adaln")
+        print(f"[Model] emotion_dim={emotion_dim}, mode={emotion_mode}")
 
         enhanced = EnhancedF5TTS(
             cfm_model=cfm,                                     # ← full CFM
-            emotion_dim=emo_ext.get("emotion_dim", 768),
-            emotion_mode=emo_cfg.get("conditioning", {}).get("mode", "adaln"),
+            emotion_dim=emotion_dim,
+            emotion_mode=emotion_mode,
             lora_rank=lora_cfg.get("rank", 16),
             lora_alpha=lora_cfg.get("alpha", 16.0),
             lora_dropout=lora_cfg.get("dropout", 0.05),
@@ -296,6 +311,17 @@ class Trainer:
             p.requires_grad = False
         extractor.eval()
         return extractor
+
+    def _probe_emotion_dim(self) -> int:
+        """Get the actual output dimension of the emotion extractor."""
+        ext = self.emotion_extractor
+        # Check the projection layer
+        if hasattr(ext, 'emotion_dim'):
+            return ext.emotion_dim
+        # Fallback: native dim
+        if hasattr(ext, 'native_dim'):
+            return ext.native_dim
+        return 768
 
     def _build_dataloaders(self):
         ds_cfg = self.config.get("datasets", {})

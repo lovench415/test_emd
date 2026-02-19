@@ -117,13 +117,9 @@ class EnhancedF5TTS(nn.Module):
             self.language_embedding = LanguageEmbedding(embed_dim=hidden_dim)
 
         # ── Emotion → timestep bias ──
-        self.emotion_to_timestep = nn.Sequential(
-            nn.Linear(emotion_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        nn.init.zeros_(self.emotion_to_timestep[-1].weight)
-        nn.init.zeros_(self.emotion_to_timestep[-1].bias)
+        # Built lazily if actual emotion_dim differs from declared
+        self._emotion_dim_declared = emotion_dim
+        self.emotion_to_timestep = self._build_emotion_proj(emotion_dim, hidden_dim)
 
         # ── Detect DiT.forward signature ──
         self._dit_forward_params = set(inspect.signature(self.dit.forward).parameters.keys())
@@ -521,10 +517,30 @@ class EnhancedF5TTS(nn.Module):
     def _set_context(self, emotion_emb, lang_id):
         self._current_emotion_emb = emotion_emb
         if emotion_emb is not None:
+            actual_dim = emotion_emb.shape[-1]
+            expected_dim = self.emotion_to_timestep[0].in_features
+            if actual_dim != expected_dim:
+                print(f"[EnhancedF5TTS] WARNING: emotion_emb dim={actual_dim} "
+                      f"but emotion_to_timestep expects {expected_dim}. Rebuilding...")
+                self.emotion_to_timestep = self._build_emotion_proj(
+                    actual_dim, self.hidden_dim
+                ).to(emotion_emb.device)
+                self._emotion_dim_declared = actual_dim
             self._current_emotion_bias = self.emotion_to_timestep(emotion_emb)
         else:
             self._current_emotion_bias = None
         self._current_lang_id = lang_id
+
+    @staticmethod
+    def _build_emotion_proj(emotion_dim: int, hidden_dim: int) -> nn.Sequential:
+        proj = nn.Sequential(
+            nn.Linear(emotion_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        nn.init.zeros_(proj[-1].weight)
+        nn.init.zeros_(proj[-1].bias)
+        return proj
 
     def _clear_context(self):
         self._current_emotion_emb = None

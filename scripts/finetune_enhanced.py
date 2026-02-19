@@ -275,6 +275,9 @@ class Trainer:
             hidden_dim=model_cfg.get("dim", 1024),
             text_dim=model_cfg.get("text_dim", 512),
         )
+        # Print DiT structure for debugging (shows actual Linear dimensions)
+        enhanced.print_model_structure(max_depth=2)
+
         enhanced.install_hooks()                                # ← install all hooks
         enhanced = enhanced.to(self.device)
 
@@ -399,6 +402,11 @@ class Trainer:
 
         B, T, D = mel.shape
 
+        # Safety: ensure text_ids is not longer than mel frames
+        # (DiT.text_embed pads shorter text, but crashes on longer)
+        if text_ids.shape[1] > T:
+            text_ids = text_ids[:, :T]
+
         # 1. Emotion embeddings (cached → <1ms)
         emotion_emb = self._extract_emotion_batch(audio_paths)
 
@@ -458,6 +466,8 @@ class Trainer:
             paths = batch["audio_paths"]
 
             B, T, D = mel.shape
+            if text_ids.shape[1] > T:
+                text_ids = text_ids[:, :T]
             emo = self._extract_emotion_batch(paths)
             gen_mask = random_span_mask(mel_lengths, T).to(self.device)
             cond = mel.clone()

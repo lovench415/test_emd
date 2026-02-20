@@ -31,12 +31,12 @@ from importlib.resources import files
 import torch
 from cached_path import cached_path
 
-from src.f5_tts.model.backbones.enhanced_dit import EnhancedDiT
-from src.f5_tts.model.enhanced_cfm import EnhancedCFM
-from src.f5_tts.model.enhanced_dataset import EnhancedCustomDataset, enhanced_collate_fn
-from src.f5_tts.model.enhanced_trainer import EnhancedTrainer
-from src.f5_tts.model.speaker_encoder import SpeakerEncoder
-from src.f5_tts.model.emotion_encoder import EmotionEncoder
+from f5_tts.model.backbones.enhanced_dit import EnhancedDiT
+from f5_tts.model.enhanced_cfm import EnhancedCFM
+from f5_tts.model.enhanced_dataset import EnhancedCustomDataset, enhanced_collate_fn
+from f5_tts.model.enhanced_trainer import EnhancedTrainer
+from f5_tts.model.speaker_encoder import SpeakerEncoder
+from f5_tts.model.emotion_encoder import EmotionEncoder
 from f5_tts.model.utils import get_tokenizer
 
 

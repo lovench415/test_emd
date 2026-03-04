@@ -1,0 +1,302 @@
+"""
+Enhanced CFM (Conditional Flow Matching) for F5-TTS.
+
+Extends the original with:
+  - Speaker/emotion embedding injection
+  - Multi-condition dropout (independent speaker/emotion/audio/text)
+  - Emotion-Guided CFG (EG-CFG) at inference
+"""
+from __future__ import annotations
+from typing import Callable
+import random as pyrandom
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.nn.utils.rnn import pad_sequence
+from torchdiffeq import odeint
+
+from f5_tts.model.modules import MelSpec
+from f5_tts.model.utils import (
+    default, exists, get_epss_timesteps,
+    lens_to_mask, list_str_to_idx, list_str_to_tensor, mask_from_frac_lengths,
+)
+from f5_tts.model.encoder_utils import interpolate_temporal
+
+
+
+class EnhancedCFM(nn.Module):
+    """Enhanced CFM with speaker/emotion conditioning and EG-CFG."""
+
+    def __init__(
+        self,
+        transformer: nn.Module,
+        sigma=0.0,
+        odeint_kwargs: dict = dict(method="euler"),
+        audio_drop_prob=0.3,
+        cond_drop_prob=0.2,
+        speaker_drop_prob=0.1,
+        emotion_drop_prob=0.1,
+        dropout_mode_probs: dict[str, float] | None = None,
+        num_channels=None,
+        mel_spec_module: nn.Module | None = None,
+        mel_spec_kwargs: dict = dict(),
+        frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
+        vocab_char_map: dict[str, int] | None = None,
+    ):
+        super().__init__()
+        self.frac_lengths_mask = frac_lengths_mask
+        self.mel_spec = default(mel_spec_module, MelSpec(**mel_spec_kwargs))
+        num_channels = default(num_channels, self.mel_spec.n_mel_channels)
+        self.num_channels = num_channels
+
+        self.audio_drop_prob = audio_drop_prob
+        self.cond_drop_prob = cond_drop_prob
+        self.speaker_drop_prob = speaker_drop_prob
+        self.emotion_drop_prob = emotion_drop_prob
+        # Multi-condition dropout distribution (categorical, CFG-aligned).
+        # This replaces independent Bernoulli drops with a single sampled mode,
+        # so coverage of {uncond, voice_only, full, no_speaker} is controlled.
+        # If dropout_mode_probs is not provided, we derive a sane default from
+        # existing *_drop_prob args and then renormalize to sum to 1.
+
+        if dropout_mode_probs is None:
+            dropout_mode_probs = {
+                'uncond': float(self.cond_drop_prob),
+                'voice_only': float(self.emotion_drop_prob),
+                'no_speaker': float(self.speaker_drop_prob),
+                'textless': 0.10,  # NEW: train text-drop CFG branch
+            }
+            p_full = 1.0 - sum(dropout_mode_probs.values())
+            dropout_mode_probs['full'] = max(0.0, p_full)
+        # Renormalize (in case of rounding / user input)
+        total_p = sum(dropout_mode_probs.values())
+
+        if total_p <= 0:
+            dropout_mode_probs = {'full': 1.0}
+        else:
+            dropout_mode_probs = {k: v / total_p for k, v in dropout_mode_probs.items()}
+
+        self.dropout_mode_probs = dropout_mode_probs
+        self._dropout_modes = list(dropout_mode_probs.keys())
+        self._dropout_probs = [dropout_mode_probs[m] for m in self._dropout_modes]
+
+        self.transformer = transformer
+        self.dim = transformer.dim
+        self.sigma = sigma
+        self.odeint_kwargs = odeint_kwargs
+        self.vocab_char_map = vocab_char_map
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    # ── Shared helpers ────────────────────────────────────────────────
+
+    def _to_mel(self, inp: torch.Tensor) -> torch.Tensor:
+        """Convert raw waveform to mel if needed."""
+        if inp.ndim == 2:
+            inp = self.mel_spec(inp).permute(0, 2, 1)
+            assert inp.shape[-1] == self.num_channels
+        return inp
+
+    def _to_text_ids(self, text, batch: int, device) -> torch.Tensor:
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+        return text
+
+    def _align_emotion_frame(self, emotion_frame, target_len):
+        """Interpolate emotion_frame to target sequence length."""
+        if emotion_frame is None:
+            return None
+        if emotion_frame.shape[1] != target_len:
+            emotion_frame = interpolate_temporal(emotion_frame, target_len)
+        # Normalize AFTER interpolation for consistent behavior
+        return F.normalize(emotion_frame, p=2, dim=-1)
+
+    # ── Inference ─────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def sample(
+        self, cond, text, duration, *, lens=None, steps=32,
+        cfg_strength=1.0, sway_sampling_coef=None, seed=None,
+        max_duration=65536, vocoder=None, use_epss=True,
+        no_ref_audio=False, duplicate_test=False, t_inter=0.1, edit_mask=None,
+        speaker_emb=None, emotion_global=None, emotion_frame=None,
+        emotion_cfg_strength=0.0,
+    ):
+        """
+        Sample with optional Emotion-Guided CFG.
+
+        EG-CFG (orthogonal decomposition):
+            pred = pred_uncond
+                   + cfg * (pred_voice - pred_uncond)       # voice identity guidance
+                   + emo_cfg * (pred_full - pred_voice)     # emotion guidance (orthogonal)
+
+        where:
+            pred_full   = all conditions (speaker + emotion + text + audio)
+            pred_voice  = speaker + text + audio, emotion dropped
+            pred_uncond = all conditions dropped
+        """
+        self.eval()
+
+        if cond.ndim == 2:
+            cond = self.mel_spec(cond).permute(0, 2, 1)
+            assert cond.shape[-1] == self.num_channels
+        cond = cond.to(next(self.parameters()).dtype)
+
+        batch, cond_seq_len, device = *cond.shape[:2], cond.device
+        if not exists(lens):
+            lens = torch.full((batch,), cond_seq_len, device=device, dtype=torch.long)
+
+        text = self._to_text_ids(text, batch, device)
+
+        cond_mask = lens_to_mask(lens)
+        if edit_mask is not None:
+            cond_mask = cond_mask & edit_mask
+        if isinstance(duration, int):
+            duration = torch.full((batch,), duration, device=device, dtype=torch.long)
+        duration = torch.maximum(
+            torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration,
+        ).clamp(max=max_duration).long()
+        max_dur = duration.amax()
+
+        if duplicate_test:
+            test_cond = F.pad(cond, (0, 0, cond_seq_len, max_dur - 2 * cond_seq_len))
+
+        cond = F.pad(cond, (0, 0, 0, max_dur - cond_seq_len))
+        if no_ref_audio:
+            cond = torch.zeros_like(cond)
+
+        cond_mask = F.pad(cond_mask, (0, max_dur - cond_mask.shape[-1]), value=False)
+        step_cond = torch.where(cond_mask.unsqueeze(-1), cond, torch.zeros_like(cond))
+        mask = lens_to_mask(duration) if batch > 1 else None
+
+        emotion_frame = self._align_emotion_frame(emotion_frame, int(max_dur))
+        use_emo_cfg = emotion_cfg_strength > 0.01 and emotion_global is not None
+
+        def fn(t, x):
+            kw = dict(cond=step_cond, text=text, time=t, mask=mask)
+            ekw = dict(speaker_emb=speaker_emb, emotion_global=emotion_global,
+                       emotion_frame=emotion_frame)
+
+            if cfg_strength < 1e-5 and not use_emo_cfg:
+                return self.transformer(x=x, **kw, cache=True, **ekw)
+
+            if use_emo_cfg:
+                # Three-branch orthogonal EG-CFG (voice + emotion)
+                p_full = self.transformer(x=x, **kw, cache=False, **ekw)
+                p_voice = self.transformer(x=x, **kw, cache=False, **ekw, drop_emotion=True)
+                p_uncond = self.transformer(
+                    x=x, **kw, cache=False,
+                    drop_audio_cond=True, drop_text=True,
+                    **ekw, drop_speaker=True, drop_emotion=True,
+                )
+
+                # pred = uncond + voice_guidance + emotion_guidance
+                return (
+                        p_uncond
+                        + cfg_strength * (p_voice - p_uncond)
+                        + emotion_cfg_strength * (p_full - p_voice)
+                )
+
+            # Standard 2-way CFG
+            pred = self.transformer(x=x, **kw, cfg_infer=True, cache=True, **ekw)
+            c, u = torch.chunk(pred, 2, dim=0)
+            return c + (c - u) * cfg_strength
+
+        # Initial noise
+        y0 = []
+        for dur in duration:
+            if exists(seed):
+                torch.manual_seed(seed)
+            y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
+        y0 = pad_sequence(y0, padding_value=0, batch_first=True)
+
+        t_start = 0
+        if duplicate_test:
+            t_start = t_inter
+            y0 = (1 - t_start) * y0 + t_start * test_cond
+            steps = int(steps * (1 - t_start))
+
+        if t_start == 0 and use_epss:
+            t = get_epss_timesteps(steps, device=self.device, dtype=step_cond.dtype)
+        else:
+            t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+
+        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+
+        out = torch.where(cond_mask.unsqueeze(-1), cond, trajectory[-1])
+        if exists(vocoder):
+            out = vocoder(out.permute(0, 2, 1))
+        return out, trajectory
+
+    # ── Training ──────────────────────────────────────────────────────
+
+    def forward(
+        self, inp, text, *, lens=None, noise_scheduler=None,
+        speaker_emb=None, emotion_global=None, emotion_frame=None,
+    ):
+        """Training forward with multi-condition dropout."""
+        inp = self._to_mel(inp)
+        batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, self.device
+        text = self._to_text_ids(text, batch, device)
+
+        if not exists(lens):
+            lens = torch.full((batch,), seq_len, device=device, dtype=torch.long)
+        else:
+            lens = lens.to(device=device, dtype=torch.long)  # arange requires integer
+        mask = lens_to_mask(lens, length=seq_len)
+
+        frac_lengths = torch.zeros((batch,), device=device).float().uniform_(*self.frac_lengths_mask)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+        if exists(mask):
+            rand_span_mask &= mask
+
+        x1 = inp
+        x0 = torch.randn_like(x1)
+        time = torch.rand((batch,), dtype=dtype, device=device)
+        t = time.unsqueeze(-1).unsqueeze(-1)
+        phi = (1 - t) * x0 + t * x1
+        flow = x1 - x0
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+        # Multi-condition dropout (categorical, CFG-aligned)
+        # Keep original audio condition dropout as an independent augmentation,
+        # but force all conditions dropped in 'uncond' mode.
+        drop_audio = pyrandom.random() < self.audio_drop_prob
+
+        mode = pyrandom.choices(self._dropout_modes, weights=self._dropout_probs, k=1)[0]
+        drop_text = drop_speaker = drop_emotion = False
+        if mode == 'uncond':
+            drop_audio = drop_text = drop_speaker = drop_emotion = True
+        elif mode == 'voice_only':
+            drop_emotion = True
+        elif mode == 'no_speaker':
+            drop_speaker = True
+        elif mode == 'textless':
+            drop_text = True
+        # else: 'full' -> keep conditions (except optional drop_audio)
+
+        emotion_frame = self._align_emotion_frame(emotion_frame, seq_len)
+
+        pred = self.transformer(
+            x=phi, cond=cond, text=text, time=time, mask=mask,
+            drop_audio_cond=drop_audio, drop_text=drop_text,
+            speaker_emb=speaker_emb, emotion_global=emotion_global,
+            emotion_frame=emotion_frame,
+            drop_speaker=drop_speaker, drop_emotion=drop_emotion,
+        )
+
+        loss = F.mse_loss(pred, flow, reduction="none")
+        masked = loss[rand_span_mask]
+        if masked.numel() == 0:
+            # Empty mask (e.g. all-zero-length samples) → zero loss that preserves autograd graph
+            return (pred * 0.0).sum(), cond, pred
+        return masked.mean(), cond, pred, mode

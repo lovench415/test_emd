@@ -114,13 +114,26 @@ class EmotionEncoder(BaseEncoder):
             global_feat: (B, raw_dim)
             frame_feat:  (B, T_frames, raw_dim)
         """
+        global_feat, frame_feat, _ = self.extract_raw_with_mask(wav, sr)
+        return global_feat, frame_feat
+
+    @torch.no_grad()
+    def extract_raw_with_mask(
+        self, wav: torch.Tensor, sr: int = 24000,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns (global_feat, frame_feat, frame_mask):
+            global_feat: (B, raw_dim)
+            frame_feat:  (B, T_frames, raw_dim)
+            frame_mask:  (B, T_frames) bool
+        """
         wav = self._prepare_wav(wav, sr)
 
         if getattr(self, "_use_funasr", False):
             return self._extract_funasr(wav)
         return self._extract_hf(wav)
 
-    def _extract_funasr(self, wav: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _extract_funasr(self, wav: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         import numpy as np
 
         frame_feats, global_feats = [], []
@@ -141,17 +154,33 @@ class EmotionEncoder(BaseEncoder):
         global_feat = torch.stack(global_feats)
         max_len = max(f.shape[0] for f in frame_feats)
         padded = [F.pad(f, (0, 0, 0, max_len - f.shape[0])) for f in frame_feats]
-        return global_feat, torch.stack(padded)
+        frame_feat = torch.stack(padded)
+        lengths = torch.tensor([f.shape[0] for f in frame_feats], device=wav.device, dtype=torch.long)
+        frame_mask = torch.arange(max_len, device=wav.device).unsqueeze(0) < lengths.unsqueeze(1)
+        return global_feat, frame_feat, frame_mask
 
-    def _extract_hf(self, wav: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _extract_hf(self, wav: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         inputs = self.feature_extractor(
             self._wav_to_list(wav),
             sampling_rate=self.sample_rate, return_tensors="pt", padding=True,
         )
-        outputs = self.encoder(inputs.input_values.to(wav.device), output_hidden_states=True)
+        input_values = inputs.input_values.to(wav.device)
+        attention_mask = getattr(inputs, "attention_mask", None)
+        attention_mask = attention_mask.to(wav.device) if attention_mask is not None else None
+        outputs = self.encoder(input_values, attention_mask=attention_mask, output_hidden_states=True)
         frame_feat = outputs.last_hidden_state       # (B, T, raw_dim)
-        global_feat = frame_feat.mean(dim=1)          # (B, raw_dim)
-        return global_feat, frame_feat
+
+        if attention_mask is not None and hasattr(self.encoder, "_get_feat_extract_output_lengths"):
+            input_lengths = attention_mask.sum(dim=-1)
+            frame_lengths = self.encoder._get_feat_extract_output_lengths(input_lengths).to(wav.device)
+            frame_lengths = frame_lengths.clamp(max=frame_feat.shape[1])
+            frame_mask = torch.arange(frame_feat.shape[1], device=wav.device).unsqueeze(0) < frame_lengths.unsqueeze(1)
+        else:
+            frame_mask = torch.ones(frame_feat.shape[:2], dtype=torch.bool, device=wav.device)
+
+        denom = frame_mask.sum(dim=1, keepdim=True).clamp_min(1).to(frame_feat.dtype)
+        global_feat = (frame_feat * frame_mask.unsqueeze(-1).to(frame_feat.dtype)).sum(dim=1) / denom
+        return global_feat, frame_feat, frame_mask
 
     # ── Temporal smoothing (shared logic) ─────────────────────────────
 

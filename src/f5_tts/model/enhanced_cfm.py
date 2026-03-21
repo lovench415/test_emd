@@ -20,7 +20,8 @@ from f5_tts.model.utils import (
     default, exists, get_epss_timesteps,
     lens_to_mask, list_str_to_idx, list_str_to_tensor, mask_from_frac_lengths,
 )
-from f5_tts.model.encoder_utils import interpolate_temporal
+from f5_tts.model.condition_types import ModelConditionBatch
+from f5_tts.model.condition_lifecycle import ConditionLifecycleManager
 
 
 
@@ -81,6 +82,7 @@ class EnhancedCFM(nn.Module):
         self._dropout_probs = [dropout_mode_probs[m] for m in self._dropout_modes]
 
         self.transformer = transformer
+        self.condition_lifecycle = ConditionLifecycleManager(transformer.cond_aggregator) if hasattr(transformer, "cond_aggregator") else None
         self.dim = transformer.dim
         self.sigma = sigma
         self.odeint_kwargs = odeint_kwargs
@@ -108,14 +110,48 @@ class EnhancedCFM(nn.Module):
             assert text.shape[0] == batch
         return text
 
-    def _align_emotion_frame(self, emotion_frame, target_len):
-        """Interpolate emotion_frame to target sequence length."""
-        if emotion_frame is None:
+    def _build_conditioning_runtime(self, conditions: ModelConditionBatch | None, *, drop_speaker=False, drop_emotion=False):
+        if conditions is None and self.condition_lifecycle is None:
             return None
-        if emotion_frame.shape[1] != target_len:
-            emotion_frame = interpolate_temporal(emotion_frame, target_len)
-        # Normalize AFTER interpolation for consistent behavior
-        return F.normalize(emotion_frame, p=2, dim=-1)
+        if self.condition_lifecycle is None:
+            raise RuntimeError("condition_lifecycle is required to build conditioning runtime from non-None conditions")
+        return self.condition_lifecycle.build_runtime(
+            conditions,
+            drop_speaker=drop_speaker,
+            drop_emotion=drop_emotion,
+        )
+
+    def sample_condition_dropout(self, batch: int, device):
+        probs = torch.tensor(self._dropout_probs, device=device, dtype=torch.float)
+        mode_ids = torch.multinomial(probs, num_samples=batch, replacement=True)
+        mode_names = [self._dropout_modes[i] for i in mode_ids.tolist()]
+
+        drop_audio = torch.rand(batch, device=device) < self.audio_drop_prob
+        drop_text = torch.zeros(batch, dtype=torch.bool, device=device)
+        drop_speaker = torch.zeros(batch, dtype=torch.bool, device=device)
+        drop_emotion = torch.zeros(batch, dtype=torch.bool, device=device)
+
+        for i, mode in enumerate(mode_names):
+            if mode == "uncond":
+                drop_audio[i] = True
+                drop_text[i] = True
+                drop_speaker[i] = True
+                drop_emotion[i] = True
+            elif mode == "voice_only":
+                drop_emotion[i] = True
+            elif mode == "no_speaker":
+                drop_speaker[i] = True
+            elif mode == "textless":
+                drop_text[i] = True
+
+        return {
+            "drop_audio": drop_audio,
+            "drop_text": drop_text,
+            "drop_speaker": drop_speaker,
+            "drop_emotion": drop_emotion,
+            "mode_ids": mode_ids,
+            "mode_names": mode_names,
+        }
 
     # ── Inference ─────────────────────────────────────────────────────
 
@@ -125,11 +161,10 @@ class EnhancedCFM(nn.Module):
         cfg_strength=1.0, sway_sampling_coef=None, seed=None,
         max_duration=65536, vocoder=None, use_epss=True,
         no_ref_audio=False, duplicate_test=False, t_inter=0.1, edit_mask=None,
-        speaker_emb=None, emotion_global=None, emotion_frame=None,
-        emotion_cfg_strength=0.0,
+        conditions: ModelConditionBatch | None = None, emotion_cfg_strength=0.0,
     ):
         """
-        Sample with optional Emotion-Guided CFG.
+        Sample with optional Emotion-Guided CFG using model-space conditions.
 
         EG-CFG (orthogonal decomposition):
             pred = pred_uncond
@@ -137,7 +172,7 @@ class EnhancedCFM(nn.Module):
                    + emo_cfg * (pred_full - pred_voice)     # emotion guidance (orthogonal)
 
         where:
-            pred_full   = all conditions (speaker + emotion + text + audio)
+            pred_full   = all model-space conditions (speaker + emotion + text + audio)
             pred_voice  = speaker + text + audio, emotion dropped
             pred_uncond = all conditions dropped
         """
@@ -175,38 +210,89 @@ class EnhancedCFM(nn.Module):
         step_cond = torch.where(cond_mask.unsqueeze(-1), cond, torch.zeros_like(cond))
         mask = lens_to_mask(duration) if batch > 1 else None
 
-        emotion_frame = self._align_emotion_frame(emotion_frame, int(max_dur))
-        use_emo_cfg = emotion_cfg_strength > 0.01 and emotion_global is not None
+        model_conditions = conditions
+        use_unconditional = (cfg_strength >= 1e-5 or emotion_cfg_strength > 0.01)
+        uncond_conditions = None
+        if self.condition_lifecycle is not None and model_conditions is not None:
+            cond_pair = self.condition_lifecycle.prepare_pair(
+                model_conditions=model_conditions,
+                target_len=max_dur,
+                use_unconditional=use_unconditional,
+            )
+            model_conditions = cond_pair.cond
+            uncond_conditions = cond_pair.uncond
+        elif model_conditions is not None and use_unconditional:
+            raise RuntimeError(
+                "EnhancedCFM.sample() received model-space conditions, but condition_lifecycle is unavailable "
+                "to build the conditional/unconditional pair required for CFG sampling."
+            )
+
+        has_global_emotion = (
+            model_conditions is not None
+            and model_conditions.emotion_global is not None
+            and (
+                model_conditions.emotion_global_present is None
+                or bool(model_conditions.emotion_global_present.any().item())
+            )
+        )
+        has_frame_emotion = (
+            model_conditions is not None
+            and model_conditions.emotion_frame is not None
+            and model_conditions.emotion_frame_mask is not None
+            and bool(model_conditions.emotion_frame_mask.any().item())
+        )
+        use_emo_cfg = emotion_cfg_strength > 0.01 and (has_global_emotion or has_frame_emotion)
+
+        # Pre-build all conditioning runtimes ONCE before the ODE loop.
+        # fn() is called 32× (one per ODE step) — rebuilding inside would
+        # repeat the full ConditioningAggregator forward pass each time.
+        cond_runtime = self._build_conditioning_runtime(model_conditions) if model_conditions is not None else None
+        uncond_runtime = self._build_conditioning_runtime(uncond_conditions) if uncond_conditions is not None else None
+        voice_runtime = (
+            self._build_conditioning_runtime(model_conditions, drop_emotion=True)
+            if use_emo_cfg and model_conditions is not None else None
+        )
 
         def fn(t, x):
             kw = dict(cond=step_cond, text=text, time=t, mask=mask)
-            ekw = dict(speaker_emb=speaker_emb, emotion_global=emotion_global,
-                       emotion_frame=emotion_frame)
 
             if cfg_strength < 1e-5 and not use_emo_cfg:
-                return self.transformer(x=x, **kw, cache=True, **ekw)
+                return self.transformer(x=x, **kw, cache=True, conditioning_runtime=cond_runtime)
 
             if use_emo_cfg:
                 # Three-branch orthogonal EG-CFG (voice + emotion)
-                p_full = self.transformer(x=x, **kw, cache=False, **ekw)
-                p_voice = self.transformer(x=x, **kw, cache=False, **ekw, drop_emotion=True)
+                p_full = self.transformer(
+                    x=x, **kw, cache=False,
+                    conditioning_runtime=cond_runtime,
+                )
+                p_voice = self.transformer(
+                    x=x, **kw, cache=False,
+                    conditioning_runtime=voice_runtime,
+                )
                 p_uncond = self.transformer(
                     x=x, **kw, cache=False,
                     drop_audio_cond=True, drop_text=True,
-                    **ekw, drop_speaker=True, drop_emotion=True,
+                    conditioning_runtime=(uncond_runtime if uncond_runtime is not None else cond_runtime),
                 )
 
-                # pred = uncond + voice_guidance + emotion_guidance
+                dtype_orig = p_full.dtype
                 return (
-                        p_uncond
-                        + cfg_strength * (p_voice - p_uncond)
-                        + emotion_cfg_strength * (p_full - p_voice)
-                )
+                        p_uncond.float()
+                        + cfg_strength * (p_voice.float() - p_uncond.float())
+                        + emotion_cfg_strength * (p_full.float() - p_voice.float())
+                ).to(dtype_orig)
 
-            # Standard 2-way CFG
-            pred = self.transformer(x=x, **kw, cfg_infer=True, cache=True, **ekw)
-            c, u = torch.chunk(pred, 2, dim=0)
-            return c + (c - u) * cfg_strength
+            p_cond = self.transformer(
+                x=x, **kw, cache=True,
+                conditioning_runtime=cond_runtime,
+            )
+            p_uncond = self.transformer(
+                x=x, **kw, cache=False,
+                drop_audio_cond=True, drop_text=True,
+                conditioning_runtime=(uncond_runtime if uncond_runtime is not None else cond_runtime),
+            )
+            dtype_orig = p_cond.dtype
+            return (p_cond.float() + (p_cond.float() - p_uncond.float()) * cfg_strength).to(dtype_orig)
 
         # Initial noise
         y0 = []
@@ -241,7 +327,7 @@ class EnhancedCFM(nn.Module):
 
     def forward(
         self, inp, text, *, lens=None, noise_scheduler=None,
-        speaker_emb=None, emotion_global=None, emotion_frame=None,
+        conditions=None,
     ):
         """Training forward with multi-condition dropout."""
         inp = self._to_mel(inp)
@@ -267,36 +353,27 @@ class EnhancedCFM(nn.Module):
         flow = x1 - x0
         cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
 
-        # Multi-condition dropout (categorical, CFG-aligned)
-        # Keep original audio condition dropout as an independent augmentation,
-        # but force all conditions dropped in 'uncond' mode.
-        drop_audio = pyrandom.random() < self.audio_drop_prob
+        dropout = self.sample_condition_dropout(batch, device)
+        from collections import Counter
+        mode_counts = Counter(dropout["mode_names"])
+        mode = mode_counts.most_common(1)[0][0]
 
-        mode = pyrandom.choices(self._dropout_modes, weights=self._dropout_probs, k=1)[0]
-        drop_text = drop_speaker = drop_emotion = False
-        if mode == 'uncond':
-            drop_audio = drop_text = drop_speaker = drop_emotion = True
-        elif mode == 'voice_only':
-            drop_emotion = True
-        elif mode == 'no_speaker':
-            drop_speaker = True
-        elif mode == 'textless':
-            drop_text = True
-        # else: 'full' -> keep conditions (except optional drop_audio)
+        model_conditions = conditions
 
-        emotion_frame = self._align_emotion_frame(emotion_frame, seq_len)
-
+        cond_out = self._build_conditioning_runtime(
+            model_conditions,
+            drop_speaker=dropout["drop_speaker"],
+            drop_emotion=dropout["drop_emotion"],
+        )
         pred = self.transformer(
             x=phi, cond=cond, text=text, time=time, mask=mask,
-            drop_audio_cond=drop_audio, drop_text=drop_text,
-            speaker_emb=speaker_emb, emotion_global=emotion_global,
-            emotion_frame=emotion_frame,
-            drop_speaker=drop_speaker, drop_emotion=drop_emotion,
+            drop_audio_cond=dropout["drop_audio"], drop_text=dropout["drop_text"],
+            conditioning_runtime=cond_out,
         )
 
         loss = F.mse_loss(pred, flow, reduction="none")
         masked = loss[rand_span_mask]
         if masked.numel() == 0:
             # Empty mask (e.g. all-zero-length samples) → zero loss that preserves autograd graph
-            return (pred * 0.0).sum(), cond, pred
+            return (pred * 0.0).sum(), cond, pred, mode
         return masked.mean(), cond, pred, mode

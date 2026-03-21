@@ -308,10 +308,13 @@ class EnhancedCFM(nn.Module):
             y0 = (1 - t_start) * y0 + t_start * test_cond
             steps = int(steps * (1 - t_start))
 
+        # Timesteps MUST be float64 — bf16/fp16 precision causes adjacent values
+        # to collapse after sway transform → odeint crashes with "t must be
+        # strictly increasing or decreasing".
         if t_start == 0 and use_epss:
-            t = get_epss_timesteps(steps, device=self.device, dtype=step_cond.dtype)
+            t = get_epss_timesteps(steps, device=self.device, dtype=torch.float64)
         else:
-            t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+            t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=torch.float64)
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 

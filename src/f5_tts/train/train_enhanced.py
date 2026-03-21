@@ -31,11 +31,16 @@ from tqdm import tqdm
 from f5_tts.model.backbones.enhanced_dit import EnhancedDiT
 from f5_tts.model.enhanced_cfm import EnhancedCFM
 from f5_tts.model.enhanced_dataset import EnhancedDataset, collate_fn
-from f5_tts.model.dataset import DynamicBatchSampler
 from f5_tts.model.speaker_encoder import SpeakerEncoder
 from f5_tts.model.emotion_encoder import EmotionEncoder
 from f5_tts.model.encoder_utils import SPEAKER_RAW_DIMS, EMOTION_RAW_DIMS
-from f5_tts.model.utils import get_tokenizer, exists, lens_to_mask, mask_from_frac_lengths
+from f5_tts.model.utils import get_tokenizer, exists, lens_to_mask, mask_from_frac_lengths, convert_char_to_pinyin
+from f5_tts.model.samplers import (
+    DynamicBatchSampler,
+    BucketDynamicBatchSampler,
+    SpeakerAwareBucketDynamicBatchSampler,
+    SpeakerBalancedDynamicBatchSampler,
+)
 
 # ── Audio constants (match F5-TTS base) ──
 TARGET_SR = 24000
@@ -68,6 +73,14 @@ def parse_args():
     g.add_argument("--learning_rate", type=float, default=3e-4)
     g.add_argument("--batch_size_per_gpu", type=int, default=19200)
     g.add_argument("--batch_size_type", default="frame", choices=["frame", "sample"])
+    g.add_argument("--bucket_batching", action="store_true")
+    g.add_argument("--speaker_aware_batching", action="store_true")
+    g.add_argument("--bucket_size", type=int, default=512)
+    g.add_argument("--max_speakers_per_batch", type=int, default=8)
+    g.add_argument("--max_samples_per_speaker", type=int, default=8)
+    g.add_argument("--speaker_balanced_batching", action="store_true")
+    g.add_argument("--speakers_per_batch", type=int, default=8)
+    g.add_argument("--samples_per_speaker", type=int, default=4)
     g.add_argument("--max_samples", type=int, default=32)
     g.add_argument("--grad_accumulation_steps", type=int, default=1)
     g.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -255,7 +268,9 @@ def build_dataloaders(args):
 
     with open(os.path.join(args.dataset_dir, "duration.json")) as f:
         durations = json.load(f)["duration"]
-
+    
+    
+    
     # ── Train / Val split ──
     n = len(ds)
     val_loader = None
@@ -296,7 +311,47 @@ def build_dataloaders(args):
 
     if args.batch_size_type == "frame":
         sampler = SequentialSampler(train_dataset)
-        bs = DynamicBatchSampler(sampler, args.batch_size_per_gpu, max_samples=args.max_samples, random_seed=args.seed)
+        
+        if args.speaker_balanced_batching:
+            bs = SpeakerBalancedDynamicBatchSampler(
+                sampler,
+                args.batch_size_per_gpu,
+                speakers_per_batch=args.speakers_per_batch,
+                samples_per_speaker=args.samples_per_speaker,
+                max_samples=args.max_samples,
+                random_seed=args.seed,
+                drop_residual=False,
+            )
+        elif args.speaker_aware_batching:
+            bs = SpeakerAwareBucketDynamicBatchSampler(
+                sampler,
+                args.batch_size_per_gpu,
+                max_samples=args.max_samples,
+                bucket_size=args.bucket_size,
+                max_speakers_per_batch=args.max_speakers_per_batch,
+                max_samples_per_speaker=args.max_samples_per_speaker,
+                random_seed=args.seed,
+                drop_residual=False,
+            )
+        elif args.bucket_batching:
+            bs = BucketDynamicBatchSampler(
+                sampler,
+                args.batch_size_per_gpu,
+                max_samples=args.max_samples,
+                bucket_size=args.bucket_size,
+                random_seed=args.seed,
+                drop_residual=False,
+            )
+        else:
+            bs = DynamicBatchSampler(
+                sampler,
+                args.batch_size_per_gpu,
+                max_samples=args.max_samples,
+                random_seed=args.seed,
+                drop_residual=False,
+            )
+        
+        #bs = DynamicBatchSampler(sampler, args.batch_size_per_gpu, max_samples=args.max_samples, random_seed=args.seed)
         train_loader = DataLoader(train_dataset, collate_fn=collate_fn,
                                   num_workers=args.num_workers, pin_memory=True,
                                   persistent_workers=args.num_workers > 0,
@@ -364,9 +419,19 @@ def validate(model, val_loader, accelerator, spk_enc, emo_enc, max_batches=0):
 
     for batch in val_loader:
         mel = batch["mel"].permute(0, 2, 1)
-        text = batch["text"]
+        text = convert_char_to_pinyin(batch["text"])
         lens = batch["mel_lengths"].long()
-        spk, emo_g, emo_f = get_embeddings(batch, dev, spk_enc, emo_enc, mel.shape[1])
+        condition_lifecycle = getattr(unwrapped, "condition_lifecycle", None)
+        conditions = (
+            condition_lifecycle.prepare(
+                batch=batch,
+                target_len=mel.shape[1],
+                device=dev,
+                speaker_encoder=spk_enc,
+                emotion_encoder=emo_enc,
+            )
+            if condition_lifecycle is not None else None
+        )
 
         # ── Deterministic forward (mirrors EnhancedCFM.forward) ──
         inp = unwrapped._to_mel(mel)
@@ -397,14 +462,16 @@ def validate(model, val_loader, accelerator, spk_enc, emo_enc, max_batches=0):
         flow = inp - x0
         cond = torch.where(rand_span_mask[..., None], torch.zeros_like(inp), inp)
 
-        emotion_frame = unwrapped._align_emotion_frame(emo_f, seq_len)
+        model_conditions = conditions
+
+        val_runtime = None
+        if condition_lifecycle is not None and model_conditions is not None:
+            val_runtime = condition_lifecycle.build_runtime(model_conditions)
 
         pred = unwrapped.transformer(
             x=phi, cond=cond, text=text_ids, time=time, mask=mask,
             drop_audio_cond=False, drop_text=False,
-            speaker_emb=spk, emotion_global=emo_g,
-            emotion_frame=emotion_frame,
-            drop_speaker=False, drop_emotion=False,
+            conditioning_runtime=val_runtime,
         )
 
         loss = F.mse_loss(pred, flow, reduction="none")
@@ -445,41 +512,6 @@ def validate(model, val_loader, accelerator, spk_enc, emo_enc, max_batches=0):
         return float("nan")
 
     return total_loss / total_frames
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Embedding extraction from batch
-# ══════════════════════════════════════════════════════════════════════
-
-def get_embeddings(batch, device, spk_enc, emo_enc, mel_len):
-    """Extract speaker/emotion embeddings from batch (cached or online).
-
-    IMPORTANT: Always returns RAW (un-projected) embeddings.
-    The ConditioningAggregator handles projection from raw→target dim
-    to ensure a single consistent representation path.
-    """
-    spk = emo_g = emo_f = None
-
-    if "speaker_raw" in batch:
-        # Cached mode: raw embeddings from disk
-        spk = batch["speaker_raw"].to(device)
-        raw_emo_g = batch.get("emotion_global_raw")
-        raw_emo_f = batch.get("emotion_frame_raw")
-
-        if raw_emo_g is not None:
-            emo_g = raw_emo_g.to(device)
-        if raw_emo_f is not None:
-            emo_f = raw_emo_f.to(device)
-
-    elif "raw_audio" in batch and spk_enc is not None:
-        # Online mode: extract raw embeddings (skip encoder's own projection)
-        wav = batch["raw_audio"].to(device)
-        sr = batch["sample_rate"]
-        with torch.no_grad():
-            spk = spk_enc.extract_raw(wav, sr=sr)
-            emo_g, emo_f = emo_enc.extract_raw(wav, sr=sr)
-
-    return spk, emo_g, emo_f
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -669,9 +701,19 @@ def main():
     start_epoch = 0
     last_ckpt = os.path.join(args.checkpoint_dir, "model_last.pt")
     if os.path.exists(last_ckpt):
-        ckpt = torch.load(last_ckpt, map_location="cpu")
+        ckpt = torch.load(last_ckpt, map_location="cpu", weights_only=True)
         # Restore online model weights
-        accelerator.unwrap_model(model).load_state_dict(ckpt.get("model_state_dict", {}), strict=False)
+        
+        model_sd = ckpt.get("model_state_dict")
+        if model_sd is not None and len(model_sd) > 0:
+            accelerator.unwrap_model(model).load_state_dict(model_sd, strict=False)
+            if is_main:
+                print(f"  Restored {len(model_sd)} model params")
+        else:
+            if is_main:
+                print("  ⚠️ No model_state_dict in checkpoint — model weights NOT restored."
+                      " Training continues from pretrained weights.")
+        
         if is_main and ema and "ema_model_state_dict" in ckpt:
             ema.load_state_dict(ckpt["ema_model_state_dict"])
         if "optimizer_state_dict" in ckpt:
@@ -714,18 +756,26 @@ def main():
         for batch in pbar:
             with accelerator.accumulate(model):
                 mel = batch["mel"].permute(0, 2, 1)       # (B, D, T) → (B, T, D)
-                text = batch["text"]
+                text = convert_char_to_pinyin(batch["text"])
                 lens = batch["mel_lengths"].long()  # arange requires integer dtype
 
-                spk, emo_g, emo_f = get_embeddings(batch, dev, spk_enc, emo_enc, mel.shape[1])
-
-                loss, _, _, mode = accelerator.unwrap_model(model)(
-                    inp=mel, text=text, lens=lens,
-                    speaker_emb=spk, emotion_global=emo_g, emotion_frame=emo_f,
+                condition_lifecycle = getattr(raw_model, "condition_lifecycle", None)
+                conditions = (
+                    condition_lifecycle.prepare_for_train(
+                        batch,
+                        target_len=mel.shape[1],
+                        device=dev,
+                        speaker_encoder=spk_enc,
+                        emotion_encoder=emo_enc,
+                    )
+                    if condition_lifecycle is not None else None
                 )
-                print(f"mode - {mode}")
-                mode_loss_sum[mode] += float(loss.detach().item())
-                mode_count[mode] += 1
+
+                loss, _, _, mode = model(
+                    inp=mel, text=text, lens=lens,
+                    conditions=conditions,
+                )
+                
                 
                 # ── NaN/Inf guard: skip corrupted batches ──
                 if not torch.isfinite(loss):
@@ -740,7 +790,10 @@ def main():
                                        "corrupted. Stopping epoch.")
                         break
                     continue
-
+                
+                mode_loss_sum[mode] += float(loss.detach().item())
+                mode_count[mode] += 1
+                
                 nan_consecutive = 0
                 accelerator.backward(loss)
 
@@ -769,22 +822,24 @@ def main():
                 if args.logger == "tensorboard" and accelerator.is_main_process:
                     writer.add_scalar("train_loss", loss.item(), step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
-
-                for m in ("full", "uncond", "voice_only", "no_speaker", "textless"):
-                    ls = torch.tensor(mode_loss_sum.get(m, 0.0), device=accelerator.device, dtype=torch.float32)
-                    ct = torch.tensor(mode_count.get(m, 0), device=accelerator.device, dtype=torch.float32)
-
-                    ls = accelerator.reduce(ls, reduction="sum")
-                    ct = accelerator.reduce(ct, reduction="sum")
-
-                    if is_main and ct.item() > 0:
-                        accelerator.log({f"train/loss_{m}": (ls / ct).item()}, step=step)
-                    
-                        if args.logger == "tensorboard":
-                            writer.add_scalar(f"train/loss_{m}", (ls / ct).item(), step)
                 
-                mode_loss_sum.clear()
-                mode_count.clear()
+                if step % 100 == 0 and any(mode_count.values()):
+                
+                    for m in ("full", "uncond", "voice_only", "no_speaker", "textless"):
+                        ls = torch.tensor(mode_loss_sum.get(m, 0.0), device=accelerator.device, dtype=torch.float32)
+                        ct = torch.tensor(mode_count.get(m, 0), device=accelerator.device, dtype=torch.float32)
+
+                        ls = accelerator.reduce(ls, reduction="sum")
+                        ct = accelerator.reduce(ct, reduction="sum")
+
+                        if is_main and ct.item() > 0:
+                            accelerator.log({f"train/loss_{m}": (ls / ct).item()}, step=step)
+                        
+                            if args.logger == "tensorboard":
+                                writer.add_scalar(f"train/loss_{m}", (ls / ct).item(), step)
+                    
+                    mode_loss_sum.clear()
+                    mode_count.clear()
                 
             if step % args.last_per_updates == 0 and accelerator.sync_gradients:
                 accelerator.wait_for_everyone()
@@ -854,6 +909,8 @@ def main():
         if val_loader is not None and best_val_loss < float("inf"):
             print(f"Best val loss: {best_val_loss:.5f} → {args.checkpoint_dir}/model_best.pt")
     accelerator.end_training()
+    if writer and hasattr(writer, 'close'):
+        writer.close()
 
 
 if __name__ == "__main__":

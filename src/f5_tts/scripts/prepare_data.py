@@ -42,7 +42,6 @@ import torch
 import torchaudio
 import numpy as np
 from tqdm import tqdm
-from tinytag import TinyTag
 
 
 # =====================================================================
@@ -64,8 +63,8 @@ def validate_audio(audio_path: str, min_duration: float = 0.3, max_duration: flo
         - No NaN/Inf values
     """
     try:
-        info = TinyTag.get(audio_path)
-        duration = info.duration
+        info = torchaudio.info(audio_path)
+        duration = info.num_frames / info.sample_rate
         
         if duration < min_duration or duration > max_duration:
             return None
@@ -86,7 +85,7 @@ def validate_audio(audio_path: str, min_duration: float = 0.3, max_duration: flo
             "audio_path": os.path.abspath(audio_path),
             "duration": duration,
             "sample_rate": sr,
-            "channels": info.channels,
+            "channels": info.num_channels,
             "rms": rms.item(),
         }
     except Exception as e:
@@ -151,6 +150,7 @@ def prepare_metadata(
             "text": entry["text"],
             "duration": result["duration"],
             "language": entry.get("language", "unknown"),
+            "speaker": entry.get("speaker", "default"),
         })
         durations.append(result["duration"])
     
@@ -193,7 +193,7 @@ def prepare_metadata(
 
 
 def _load_csv_metadata(path: str) -> list[dict]:
-    """Load pipe-separated metadata: audio_path|text|language"""
+    """Load pipe-separated metadata: audio_path|text|language[|speaker]"""
     entries = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -205,9 +205,10 @@ def _load_csv_metadata(path: str) -> list[dict]:
                 entry = {
                     "audio_path": parts[0].strip(),
                     "text": parts[1].strip(),
+                    "speaker": parts[2].strip(),
+                    "language": 'ru',
                 }
-                if len(parts) >= 3:
-                    entry["language"] = parts[2].strip()
+                
                 entries.append(entry)
     return entries
 

@@ -15,10 +15,12 @@ import json
 import math
 import os
 import shutil
+from collections import defaultdict
 from importlib.resources import files
 import re
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
@@ -34,6 +36,7 @@ from f5_tts.model.enhanced_dataset import EnhancedDataset, collate_fn
 from f5_tts.model.speaker_encoder import SpeakerEncoder
 from f5_tts.model.emotion_encoder import EmotionEncoder
 from f5_tts.model.encoder_utils import SPEAKER_RAW_DIMS, EMOTION_RAW_DIMS
+from f5_tts.model.prosody_encoder import ProsodyEncoder, PROSODY_RAW_DIM
 from f5_tts.model.utils import get_tokenizer, exists, lens_to_mask, mask_from_frac_lengths, convert_char_to_pinyin
 from f5_tts.model.samplers import (
     DynamicBatchSampler,
@@ -85,6 +88,14 @@ def parse_args():
     g.add_argument("--grad_accumulation_steps", type=int, default=1)
     g.add_argument("--max_grad_norm", type=float, default=1.0)
     g.add_argument("--num_warmup_updates", type=int, default=2000)
+    g.add_argument("--lr_base_mult", type=float, default=0.1,
+                   help="LR multiplier for unfrozen DiT blocks (× base LR). "
+                        "Lower = safer for pretrained weights.")
+    g.add_argument("--lr_prosody_mult", type=float, default=2.0,
+                   help="LR multiplier for prosody modules (× base LR). "
+                        "Higher = faster cold-start for new prosody pathway.")
+    g.add_argument("--lr_duration_mult", type=float, default=1.0,
+                   help="LR multiplier for duration predictor (× base LR).")
 
     g = p.add_argument_group("freeze strategy")
     g.add_argument("--freeze_base", action="store_true", default=True)
@@ -99,6 +110,15 @@ def parse_args():
     g.add_argument("--no_cross_attn", action="store_true")
     g.add_argument("--no_adaln", action="store_true")
     g.add_argument("--no_input_add", action="store_true")
+
+    g = p.add_argument_group("prosody")
+    g.add_argument("--prosody_backend", default="dio", choices=["dio", "harvest", "crepe"])
+    g.add_argument("--prosody_dim", type=int, default=256)
+    g.add_argument("--no_prosody", action="store_true", help="Disable prosody conditioning")
+
+    g = p.add_argument_group("duration predictor")
+    g.add_argument("--use_duration_predictor", action="store_true", help="Train prosody-conditioned duration predictor")
+    g.add_argument("--dur_loss_weight", type=float, default=0.1, help="Weight for duration prediction loss")
 
     g = p.add_argument_group("checkpoints")
     g.add_argument("--checkpoint_dir", default="ckpts/f5tts_enhanced")
@@ -164,6 +184,9 @@ def build_model(args, vocab_size: int) -> EnhancedCFM:
         use_cross_attn_cond=not args.no_cross_attn,
         speaker_raw_dim=SPEAKER_RAW_DIMS.get(args.speaker_backend, 512),
         emotion_raw_dim=EMOTION_RAW_DIMS.get(args.emotion_backend, 768),
+        prosody_dim=args.prosody_dim,
+        prosody_raw_dim=PROSODY_RAW_DIM if not args.no_prosody else None,
+        use_prosody_cross_attn=not args.no_prosody,
     )
 
     return EnhancedCFM(
@@ -172,6 +195,8 @@ def build_model(args, vocab_size: int) -> EnhancedCFM:
             n_fft=N_FFT, hop_length=HOP, win_length=WIN,
             n_mel_channels=N_MEL, target_sample_rate=TARGET_SR, mel_spec_type=MEL_TYPE,
         ),
+        use_duration_predictor=getattr(args, "use_duration_predictor", False),
+        speaker_emb_dim=args.speaker_emb_dim,
     )
 
 
@@ -208,7 +233,7 @@ def load_pretrained_weights(model: EnhancedCFM, ckpt_path: str):
 # ══════════════════════════════════════════════════════════════════════
 
 def apply_freeze(model: EnhancedCFM, freeze_base: bool, unfreeze_top_k: int):
-    """Freeze base model weights; keep conditioning trainable."""
+    """Freeze base model weights; keep conditioning + duration predictor trainable."""
     if not freeze_base:
         return
 
@@ -216,6 +241,10 @@ def apply_freeze(model: EnhancedCFM, freeze_base: bool, unfreeze_top_k: int):
         p.requires_grad = False
     for p in model.transformer.cond_aggregator.parameters():
         p.requires_grad = True
+    # Duration predictor is a separate module — must be explicitly unfrozen
+    if model.duration_predictor is not None:
+        for p in model.duration_predictor.parameters():
+            p.requires_grad = True
 
     if unfreeze_top_k > 0:
         blocks = model.transformer.transformer_blocks
@@ -232,6 +261,95 @@ def apply_freeze(model: EnhancedCFM, freeze_base: bool, unfreeze_top_k: int):
     print(f"  Total: {total:,} | Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
 
 
+def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
+    """Build optimizer parameter groups with differential learning rates.
+
+    Groups (from highest to lowest LR):
+        prosody:      prosody-specific modules (cold start, needs fast LR)
+        conditioning: cond_aggregator excluding prosody (speaker/emotion, near-converged)
+        duration:     duration predictor (separate task)
+        base:         unfrozen DiT blocks (pretrained, needs conservative LR)
+
+    All LRs are multiples of args.learning_rate.
+    """
+    lr = args.learning_rate
+
+    # Collect parameter id sets for each group
+    prosody_ids = set()
+    base_ids = set()
+    duration_ids = set()
+
+    agg = model.transformer.cond_aggregator
+
+    # Prosody-specific parameters inside cond_aggregator
+    prosody_module_names = [
+        "prosody_raw_proj", "prosody_direct_proj", "prosody_temporal_smooth",
+        "prosody_cross_attns", "prosody_global_proj", "emo_prosody_fusion",
+    ]
+    for name in prosody_module_names:
+        mod = getattr(agg, name, None)
+        if mod is not None:
+            if isinstance(mod, nn.Parameter):
+                prosody_ids.add(id(mod))
+            else:
+                for p in mod.parameters():
+                    prosody_ids.add(id(p))
+    # Scalar gates
+    for attr in ("prosody_block_gates", "prosody_global_gate"):
+        p = getattr(agg, attr, None)
+        if p is not None and isinstance(p, nn.Parameter):
+            prosody_ids.add(id(p))
+
+    # Duration predictor
+    if model.duration_predictor is not None:
+        for p in model.duration_predictor.parameters():
+            duration_ids.add(id(p))
+
+    # Unfrozen DiT blocks (top-K + norm_out + proj_out)
+    if args.freeze_base and args.unfreeze_top_k > 0:
+        blocks = model.transformer.transformer_blocks
+        for i in range(max(0, len(blocks) - args.unfreeze_top_k), len(blocks)):
+            for p in blocks[i].parameters():
+                if p.requires_grad:
+                    base_ids.add(id(p))
+        for mod in (model.transformer.norm_out, model.transformer.proj_out):
+            for p in mod.parameters():
+                if p.requires_grad:
+                    base_ids.add(id(p))
+
+    # Build groups — each trainable param in exactly one group
+    prosody_params, cond_params, dur_params, base_params = [], [], [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in prosody_ids:
+            prosody_params.append(p)
+        elif pid in duration_ids:
+            dur_params.append(p)
+        elif pid in base_ids:
+            base_params.append(p)
+        else:
+            cond_params.append(p)  # everything else (speaker/emotion conditioning, mel_spec if trainable)
+
+    groups = []
+    if cond_params:
+        groups.append({"params": cond_params, "lr": lr, "name": "conditioning"})
+    if prosody_params:
+        groups.append({"params": prosody_params, "lr": lr * args.lr_prosody_mult, "name": "prosody"})
+    if dur_params:
+        groups.append({"params": dur_params, "lr": lr * args.lr_duration_mult, "name": "duration"})
+    if base_params:
+        groups.append({"params": base_params, "lr": lr * args.lr_base_mult, "name": "base_blocks"})
+
+    # Summary
+    for g in groups:
+        n = sum(p.numel() for p in g["params"])
+        print(f"  Param group '{g['name']}': {n:,} params, lr={g['lr']:.2e}")
+
+    return groups
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Encoder loading (online extraction fallback)
 # ══════════════════════════════════════════════════════════════════════
@@ -240,7 +358,7 @@ def maybe_load_encoders(args, dev: str):
     """Load encoders only if no precomputed embeddings exist."""
     if args.embedding_dir and os.path.exists(os.path.join(args.embedding_dir, "0.pt")):
         print("Using precomputed embeddings — encoders NOT loaded")
-        return None, None
+        return None, None, None
 
     print("Loading encoders for online extraction (slower; run prepare_data.py for speed)")
     spk = SpeakerEncoder(backend=args.speaker_backend, output_dim=args.speaker_emb_dim,
@@ -250,7 +368,16 @@ def maybe_load_encoders(args, dev: str):
     for enc in (spk, emo):
         for p in enc.parameters():
             p.requires_grad = False
-    return spk, emo
+
+    prosody_enc = None
+    if not args.no_prosody:
+        prosody_enc = ProsodyEncoder(
+            backend=args.prosody_backend, output_dim=args.prosody_dim, device=dev,
+        ).to(dev).eval()
+        for p in prosody_enc.parameters():
+            p.requires_grad = False
+
+    return spk, emo, prosody_enc
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -387,7 +514,7 @@ def build_dataloaders(args):
 # ══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def validate(model, val_loader, accelerator, spk_enc, emo_enc, max_batches=0):
+def validate(model, val_loader, accelerator, spk_enc, emo_enc, max_batches=0, prosody_enc=None):
     """
     Deterministic validation pass — returns average loss comparable across runs.
 
@@ -429,6 +556,7 @@ def validate(model, val_loader, accelerator, spk_enc, emo_enc, max_batches=0):
                 device=dev,
                 speaker_encoder=spk_enc,
                 emotion_encoder=emo_enc,
+                prosody_encoder=prosody_enc,
             )
             if condition_lifecycle is not None else None
         )
@@ -611,7 +739,7 @@ def clean_old_checkpoints(ckpt_dir: str, keep: int):
 def main():
     args = parse_args()
 
-    writer = ''
+    writer = None
     ddp = DistributedDataParallelKwargs(find_unused_parameters=True)
    
     accelerator = Accelerator(
@@ -656,15 +784,16 @@ def main():
     if ema:
         ema.to(dev)
 
-    # 6. Optimizer
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(trainable, lr=args.learning_rate)
+    # 6. Optimizer with differential learning rates
+    param_groups = build_param_groups(model, args)
+    optimizer = AdamW(param_groups, lr=args.learning_rate)  # base lr as fallback
+    trainable = [p for g in param_groups for p in g["params"]]
 
     # 7. Data
     dataset, dataloader, val_loader = build_dataloaders(args)
 
     # 8. Encoders
-    spk_enc, emo_enc = maybe_load_encoders(args, str(dev))
+    spk_enc, emo_enc, prosody_enc = maybe_load_encoders(args, str(dev))
 
     # 9. Scheduler
     warmup = args.num_warmup_updates * accelerator.num_processes
@@ -717,9 +846,18 @@ def main():
         if is_main and ema and "ema_model_state_dict" in ckpt:
             ema.load_state_dict(ckpt["ema_model_state_dict"])
         if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as e:
+                if is_main:
+                    print(f"  ⚠ Optimizer state mismatch (param groups changed?): {e}")
+                    print("    Optimizer reset — LR restarts from warmup.")
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except (ValueError, KeyError) as e:
+                if is_main:
+                    print(f"  ⚠ Scheduler state mismatch: {e}")
         step = ckpt.get("step", ckpt.get("update", 0))
         start_epoch = ckpt.get("epoch", 0)
         if is_main:
@@ -737,8 +875,6 @@ def main():
 
     best_val_loss = float("inf")
     raw_model = accelerator.unwrap_model(model)  # unwrapped for checkpoint saving
-    
-    from collections import defaultdict
     
     mode_loss_sum = defaultdict(float)
     mode_count = defaultdict(int)
@@ -767,18 +903,30 @@ def main():
                         device=dev,
                         speaker_encoder=spk_enc,
                         emotion_encoder=emo_enc,
+                        prosody_encoder=prosody_enc,
                     )
                     if condition_lifecycle is not None else None
                 )
 
-                loss, _, _, mode = model(
+                loss, _, _, mode_names, dur_loss = model(
                     inp=mel, text=text, lens=lens,
                     conditions=conditions,
+                    # Duration predictor inputs
+                    prosody_raw=batch.get("prosody_raw"),
+                    prosody_mask=batch.get("prosody_mask"),
+                    text_byte_lens=torch.tensor(
+                        [len(t.encode("utf-8")) for t in batch["text"]],
+                        dtype=torch.long,
+                    ) if getattr(raw_model, "duration_predictor", None) is not None else None,
+                    speaker_emb_for_dur=batch.get("speaker_raw"),
                 )
+
+                # Combined loss (dur_loss is 0.0 when predictor disabled — free to add)
+                total_loss = loss + args.dur_loss_weight * dur_loss
                 
                 
                 # ── NaN/Inf guard: skip corrupted batches ──
-                if not torch.isfinite(loss):
+                if not torch.isfinite(total_loss):
                     optimizer.zero_grad()
                     nan_consecutive += 1
                     if is_main:
@@ -791,11 +939,16 @@ def main():
                         break
                     continue
                 
-                mode_loss_sum[mode] += float(loss.detach().item())
-                mode_count[mode] += 1
+                # Per-mode loss tracking: distribute batch loss across all modes present.
+                # This is approximate (batch loss ≠ per-sample loss), but avoids
+                # the previous bug of attributing the entire loss to the most common mode.
+                loss_val = float(loss.detach().item())
+                for m in mode_names:
+                    mode_loss_sum[m] += loss_val
+                    mode_count[m] += 1
                 
                 nan_consecutive = 0
-                accelerator.backward(loss)
+                accelerator.backward(total_loss)
 
                 # Only step optimizer on sync steps (i.e., after gradient accumulation)
                 if accelerator.sync_gradients:
@@ -825,7 +978,7 @@ def main():
                 
                 if step % 100 == 0 and any(mode_count.values()):
                 
-                    for m in ("full", "uncond", "voice_only", "no_speaker", "textless"):
+                    for m in ("full", "uncond", "voice_only", "no_emotion", "no_prosody", "no_speaker", "textless"):
                         ls = torch.tensor(mode_loss_sum.get(m, 0.0), device=accelerator.device, dtype=torch.float32)
                         ct = torch.tensor(mode_count.get(m, 0), device=accelerator.device, dtype=torch.float32)
 
@@ -860,7 +1013,7 @@ def main():
                     and step % args.val_every == 0
                     and accelerator.sync_gradients):
                 val_loss = validate(model, val_loader, accelerator,
-                                    spk_enc, emo_enc, args.val_batches)
+                                    spk_enc, emo_enc, args.val_batches, prosody_enc=prosody_enc)
 
                 if is_main:
                     improved = val_loss < best_val_loss
@@ -881,7 +1034,7 @@ def main():
         # ── End-of-epoch validation ──
         if val_loader is not None:
             val_loss = validate(model, val_loader, accelerator,
-                                spk_enc, emo_enc, args.val_batches)
+                                spk_enc, emo_enc, args.val_batches, prosody_enc=prosody_enc)
             if is_main:
                 improved = val_loss < best_val_loss
                 marker = " ★ best" if improved else ""

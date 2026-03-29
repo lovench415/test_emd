@@ -42,7 +42,7 @@ import torch
 import torchaudio
 import numpy as np
 from tqdm import tqdm
-
+from tinytag import TinyTag
 
 # =====================================================================
 # Stage 1: Raw Data Preparation
@@ -63,8 +63,8 @@ def validate_audio(audio_path: str, min_duration: float = 0.3, max_duration: flo
         - No NaN/Inf values
     """
     try:
-        info = torchaudio.info(audio_path)
-        duration = info.num_frames / info.sample_rate
+        info = TinyTag.get(audio_path)
+        duration = info.duration
         
         if duration < min_duration or duration > max_duration:
             return None
@@ -85,7 +85,7 @@ def validate_audio(audio_path: str, min_duration: float = 0.3, max_duration: flo
             "audio_path": os.path.abspath(audio_path),
             "duration": duration,
             "sample_rate": sr,
-            "channels": info.num_channels,
+            "channels": info.channels,
             "rms": rms.item(),
         }
     except Exception as e:

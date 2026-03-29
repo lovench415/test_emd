@@ -132,14 +132,20 @@ class EnhancedDataset(Dataset):
                 speaker_raw = emb.get("speaker_raw")
                 emotion_global_raw = emb.get("emotion_global_raw")
                 emotion_frame_raw = emb.get("emotion_frame_raw")
+                prosody_raw = emb.get("prosody_raw")
+                prosody_mask = emb.get("prosody_mask")
             else:
                 speaker_raw = None
                 emotion_global_raw = None
                 emotion_frame_raw = None
+                prosody_raw = None
+                prosody_mask = None
 
             result["speaker_raw"] = speaker_raw
             result["emotion_global_raw"] = emotion_global_raw
             result["emotion_frame_raw"] = emotion_frame_raw
+            result["prosody_raw"] = prosody_raw
+            result["prosody_mask"] = prosody_mask
             result["speaker_present"] = speaker_raw is not None
             result["emotion_global_present"] = emotion_global_raw is not None
 
@@ -200,10 +206,8 @@ def collate_fn(batch: list[dict]) -> dict:
         frame_lengths = torch.tensor([0 if f is None else f.shape[0] for f in frames], dtype=torch.long)
         result["emotion_frame_lengths"] = frame_lengths
         max_f = int(frame_lengths.max().item()) if frame_lengths.numel() else 0
-        if max_f > 0:
+        if max_f > 0 and valid:
             result["emotion_frame_mask"] = torch.arange(max_f).unsqueeze(0) < frame_lengths.unsqueeze(1)
-        # else: all frames None — don't set mask (validate_raw requires both or neither)
-        if valid:
             raw_dim = valid[0].shape[-1]
             padded = []
             for f in frames:
@@ -213,6 +217,35 @@ def collate_fn(batch: list[dict]) -> dict:
                     f = F.pad(f, (0, 0, 0, max_f - f.shape[0]))
                 padded.append(f)
             result["emotion_frame_raw"] = torch.stack(padded)
+
+    # Prosody: same padding logic as emotion_frame, independent of raw_audio
+    if "prosody_raw" in batch[0] or any("prosody_raw" in item for item in batch):
+        p_frames = [item.get("prosody_raw") for item in batch]
+        p_masks = [item.get("prosody_mask") for item in batch]
+        p_valid = [f for f in p_frames if f is not None]
+        p_lengths = torch.tensor([0 if f is None else f.shape[0] for f in p_frames], dtype=torch.long)
+        max_pf = int(p_lengths.max().item()) if p_lengths.numel() else 0
+        if max_pf > 0:
+            # Build mask from per-sample masks or lengths
+            if any(m is not None for m in p_masks):
+                padded_masks = []
+                for m, l in zip(p_masks, p_lengths):
+                    if m is None:
+                        padded_masks.append(torch.zeros(max_pf, dtype=torch.bool))
+                    else:
+                        padded_masks.append(F.pad(m, (0, max_pf - m.shape[0]), value=False))
+                result["prosody_mask"] = torch.stack(padded_masks)
+            else:
+                result["prosody_mask"] = torch.arange(max_pf).unsqueeze(0) < p_lengths.unsqueeze(1)
+        if p_valid:
+            p_dim = p_valid[0].shape[-1]
+            padded_p = []
+            for f in p_frames:
+                if f is None:
+                    padded_p.append(torch.zeros(max_pf, p_dim))
+                else:
+                    padded_p.append(F.pad(f, (0, 0, 0, max_pf - f.shape[0])))
+            result["prosody_raw"] = torch.stack(padded_p)
 
     if any("raw_audio" in item for item in batch):
         audios = [item.get("raw_audio") for item in batch]

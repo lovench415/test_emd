@@ -45,15 +45,19 @@ class ConditionLifecycleManager:
             speaker_raw=move("speaker_raw"),
             emotion_global_raw=move("emotion_global_raw"),
             emotion_frame_raw=move("emotion_frame_raw"),
+            prosody_raw=move("prosody_raw"),
             speaker_present=move("speaker_present"),
             emotion_global_present=move("emotion_global_present"),
             emotion_frame_mask=move("emotion_frame_mask"),
+            prosody_mask=move("prosody_mask"),
         )
 
         raw.speaker_present = self._normalize_global_present(raw.speaker_present)
         raw.emotion_global_present = self._normalize_global_present(raw.emotion_global_present)
         if raw.emotion_frame_mask is not None:
             raw.emotion_frame_mask = raw.emotion_frame_mask.to(dtype=torch.bool)
+        if raw.prosody_mask is not None:
+            raw.prosody_mask = raw.prosody_mask.to(dtype=torch.bool)
 
         return raw
 
@@ -199,6 +203,12 @@ class ConditionLifecycleManager:
             raise ValueError("emotion_frame_raw and speaker_present batch sizes differ")
         if raw_conditions.emotion_frame_raw is not None and raw_conditions.emotion_global_present is not None and raw_conditions.emotion_frame_raw.shape[0] != raw_conditions.emotion_global_present.shape[0]:
             raise ValueError("emotion_frame_raw and emotion_global_present batch sizes differ")
+        if raw_conditions.prosody_raw is not None and raw_conditions.prosody_mask is None:
+            raise ValueError("prosody_raw requires prosody_mask")
+        if raw_conditions.prosody_raw is None and raw_conditions.prosody_mask is not None:
+            raise ValueError("prosody_mask was provided without prosody_raw")
+        if raw_conditions.prosody_raw is not None and raw_conditions.prosody_raw.shape[:2] != raw_conditions.prosody_mask.shape:
+            raise ValueError("prosody_raw and prosody_mask have inconsistent shapes")
         return raw_conditions
 
     def to_model_conditions(self, raw_conditions: RawConditionBatch | None, *, target_len: int | None) -> ModelConditionBatch:
@@ -215,6 +225,7 @@ class ConditionLifecycleManager:
         device=None,
         speaker_encoder=None,
         emotion_encoder=None,
+        prosody_encoder=None,
     ) -> ModelConditionBatch:
         """Canonical public entrypoint for model-space conditions.
 
@@ -243,6 +254,17 @@ class ConditionLifecycleManager:
                 emotion_encoder=emotion_encoder,
                 device=device,
             )
+            # Prosody online extraction (separate from speaker/emotion backfill
+            # because prosody is fast, deterministic, and has simpler logic)
+            if prosody_encoder is not None and raw.prosody_raw is None:
+                raw_audio = batch.get("raw_audio")
+                if raw_audio is not None and "sample_rate" in batch:
+                    with torch.no_grad():
+                        p_raw, p_mask = prosody_encoder.extract_raw(
+                            raw_audio.to(device), sr=batch["sample_rate"],
+                        )
+                    raw.prosody_raw = p_raw
+                    raw.prosody_mask = p_mask
             return self.to_model_conditions(raw, target_len=target_len)
 
         return self.to_model_conditions(raw_conditions, target_len=target_len)
@@ -258,6 +280,7 @@ class ConditionLifecycleManager:
         device=None,
         speaker_encoder=None,
         emotion_encoder=None,
+        prosody_encoder=None,
     ) -> ConditionPairBatch:
         cond = self.prepare(
             batch=batch,
@@ -267,6 +290,7 @@ class ConditionLifecycleManager:
             device=device,
             speaker_encoder=speaker_encoder,
             emotion_encoder=emotion_encoder,
+            prosody_encoder=prosody_encoder,
         )
         return self.make_condition_pair(cond, use_unconditional=use_unconditional)
 
@@ -277,6 +301,7 @@ class ConditionLifecycleManager:
         *,
         drop_speaker: torch.Tensor | bool | None = None,
         drop_emotion: torch.Tensor | bool | None = None,
+        drop_prosody: torch.Tensor | bool | None = None,
     ):
         cond_module = getattr(self.adapter, "conditioning_module", None)
         if cond_module is None:
@@ -287,6 +312,7 @@ class ConditionLifecycleManager:
             conditions=model_conditions,
             drop_speaker=drop_speaker,
             drop_emotion=drop_emotion,
+            drop_prosody=drop_prosody,
         )
         return cond_module.build_runtime(outputs)
 
@@ -300,8 +326,10 @@ class ConditionLifecycleManager:
         device=None,
         speaker_encoder=None,
         emotion_encoder=None,
+        prosody_encoder=None,
         drop_speaker: torch.Tensor | bool | None = None,
         drop_emotion: torch.Tensor | bool | None = None,
+        drop_prosody: torch.Tensor | bool | None = None,
     ):
         cond = self.prepare(
             batch=batch,
@@ -311,8 +339,9 @@ class ConditionLifecycleManager:
             device=device,
             speaker_encoder=speaker_encoder,
             emotion_encoder=emotion_encoder,
+            prosody_encoder=prosody_encoder,
         )
-        return self.build_runtime(cond, drop_speaker=drop_speaker, drop_emotion=drop_emotion)
+        return self.build_runtime(cond, drop_speaker=drop_speaker, drop_emotion=drop_emotion, drop_prosody=drop_prosody)
 
     def prepare_runtime_pair(
         self,
@@ -325,8 +354,10 @@ class ConditionLifecycleManager:
         device=None,
         speaker_encoder=None,
         emotion_encoder=None,
+        prosody_encoder=None,
         drop_speaker: torch.Tensor | bool | None = None,
         drop_emotion: torch.Tensor | bool | None = None,
+        drop_prosody: torch.Tensor | bool | None = None,
     ) -> tuple[object, object | None, ConditionPairBatch]:
         pair = self.prepare_pair(
             batch=batch,
@@ -337,18 +368,20 @@ class ConditionLifecycleManager:
             device=device,
             speaker_encoder=speaker_encoder,
             emotion_encoder=emotion_encoder,
+            prosody_encoder=prosody_encoder,
         )
-        cond_runtime = self.build_runtime(pair.cond, drop_speaker=drop_speaker, drop_emotion=drop_emotion)
+        cond_runtime = self.build_runtime(pair.cond, drop_speaker=drop_speaker, drop_emotion=drop_emotion, drop_prosody=drop_prosody)
         uncond_runtime = self.build_runtime(pair.uncond) if pair.uncond is not None else None
         return cond_runtime, uncond_runtime, pair
 
-    def prepare_for_train(self, batch: dict, *, target_len: int, device, speaker_encoder=None, emotion_encoder=None) -> ModelConditionBatch:
+    def prepare_for_train(self, batch: dict, *, target_len: int, device, speaker_encoder=None, emotion_encoder=None, prosody_encoder=None) -> ModelConditionBatch:
         return self.prepare(
             batch=batch,
             target_len=target_len,
             device=device,
             speaker_encoder=speaker_encoder,
             emotion_encoder=emotion_encoder,
+            prosody_encoder=prosody_encoder,
         )
 
     def prepare_for_infer(self, raw_conditions: RawConditionBatch | None, *, target_len: int | None) -> ModelConditionBatch:
@@ -360,13 +393,18 @@ class ConditionLifecycleManager:
         zeros_sp = None if model_conditions.speaker_present is None else torch.zeros_like(model_conditions.speaker_present)
         zeros_em = None if model_conditions.emotion_global_present is None else torch.zeros_like(model_conditions.emotion_global_present)
         zeros_fm = None if model_conditions.emotion_frame_mask is None else torch.zeros_like(model_conditions.emotion_frame_mask)
+        zeros_pm = None if model_conditions.prosody_mask is None else torch.zeros_like(model_conditions.prosody_mask)
         return ModelConditionBatch(
             speaker=model_conditions.speaker,
             emotion_global=model_conditions.emotion_global,
             emotion_frame=model_conditions.emotion_frame,
+            prosody_frame=model_conditions.prosody_frame,
+            prosody_direct=None,  # None → direct addition skipped
+            prosody_global=None,  # None → AdaLN enrichment skipped
             speaker_present=zeros_sp,
             emotion_global_present=zeros_em,
             emotion_frame_mask=zeros_fm,
+            prosody_mask=zeros_pm,
         )
 
     def make_condition_pair(self, model_conditions: ModelConditionBatch | None, *, use_unconditional: bool) -> ConditionPairBatch:

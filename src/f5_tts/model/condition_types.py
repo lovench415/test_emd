@@ -10,9 +10,11 @@ class RawConditionBatch:
     speaker_raw: torch.Tensor | None = None
     emotion_global_raw: torch.Tensor | None = None
     emotion_frame_raw: torch.Tensor | None = None
+    prosody_raw: torch.Tensor | None = None
     speaker_present: torch.Tensor | None = None
     emotion_global_present: torch.Tensor | None = None
     emotion_frame_mask: torch.Tensor | None = None
+    prosody_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -20,9 +22,13 @@ class ModelConditionBatch:
     speaker: torch.Tensor | None = None
     emotion_global: torch.Tensor | None = None
     emotion_frame: torch.Tensor | None = None
+    prosody_frame: torch.Tensor | None = None       # (B, T, prosody_dim) for cross-attn
+    prosody_direct: torch.Tensor | None = None       # (B, T, model_dim) for direct addition
+    prosody_global: torch.Tensor | None = None       # (B, 9) global prosody stats for AdaLN
     speaker_present: torch.Tensor | None = None
     emotion_global_present: torch.Tensor | None = None
     emotion_frame_mask: torch.Tensor | None = None
+    prosody_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -32,6 +38,9 @@ class ConditioningOutputs:
     adaln: list[torch.Tensor] | None = None
     frame_cond: torch.Tensor | None = None
     frame_mask: torch.Tensor | None = None
+    prosody_cond: torch.Tensor | None = None        # (B, T, prosody_dim) for cross-attn
+    prosody_direct: torch.Tensor | None = None       # (B, T, model_dim) for direct addition
+    prosody_frame_mask: torch.Tensor | None = None
 
 
 @dataclass

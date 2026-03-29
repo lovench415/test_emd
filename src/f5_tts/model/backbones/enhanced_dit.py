@@ -84,6 +84,13 @@ class EnhancedDiT(nn.Module):
         cross_attn_heads: int = 8, cross_attn_dim_head: int = 64,
         use_adaln_cond: bool = True, use_input_add_cond: bool = True,
         use_cross_attn_cond: bool = True, adaln_bottleneck_dim: int = 256,
+        # Prosody
+        prosody_dim: int = 256,
+        prosody_raw_dim: int | None = None,
+        use_prosody_cross_attn: bool = True,
+        prosody_cross_attn_layers: list[int] | None = None,
+        prosody_cross_attn_heads: int = 8,
+        prosody_cross_attn_dim_head: int = 64,
     ):
         super().__init__()
         self.dim = dim
@@ -108,6 +115,11 @@ class EnhancedDiT(nn.Module):
             cross_attn_layers=cross_attn_layers, cross_attn_heads=cross_attn_heads, cross_attn_dim_head=cross_attn_dim_head,
             use_adaln=use_adaln_cond, use_input_add=use_input_add_cond, use_cross_attn=use_cross_attn_cond, dropout=dropout,
             speaker_raw_dim=speaker_raw_dim, emotion_raw_dim=emotion_raw_dim, adaln_bottleneck_dim=adaln_bottleneck_dim,
+            prosody_dim=prosody_dim, prosody_raw_dim=prosody_raw_dim,
+            use_prosody_cross_attn=use_prosody_cross_attn,
+            prosody_cross_attn_layers=prosody_cross_attn_layers,
+            prosody_cross_attn_heads=prosody_cross_attn_heads,
+            prosody_cross_attn_dim_head=prosody_cross_attn_dim_head,
         )
         self._init_weights()
 

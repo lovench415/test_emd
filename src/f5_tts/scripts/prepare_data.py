@@ -205,10 +205,10 @@ def _load_csv_metadata(path: str) -> list[dict]:
                 entry = {
                     "audio_path": parts[0].strip(),
                     "text": parts[1].strip(),
-                    "speaker": parts[2].strip(),
-                    "language": 'ru',
                 }
-                
+                if len(parts) >= 3:
+                    entry["speaker"] = parts[2].strip()
+                entry["language"] = 'ru'
                 entries.append(entry)
     return entries
 
@@ -247,18 +247,21 @@ def extract_and_cache_embeddings(
     emotion_backend: str = "emotion2vec_base",
     speaker_dim: int = 512,
     emotion_dim: int = 512,
+    prosody_backend: str = "dio",
     batch_size: int = 1,
     device: str = "cuda",
     resume: bool = True,
 ):
     """
-    Stage 2: Extract speaker and emotion embeddings for all samples.
+    Stage 2: Extract speaker, emotion, and prosody embeddings for all samples.
     
     Saves one .pt file per sample:
         {index}.pt = {
             "speaker_raw":        (speaker_raw_dim,),    # 512 for WavLM-SV
             "emotion_global_raw": (emotion_raw_dim,),    # 768 for emotion2vec
             "emotion_frame_raw":  (T_frames, emotion_raw_dim),
+            "prosody_raw":        (T_frames, 5),          # log_f0, voicing, log_energy, Δf0, Δenergy
+            "prosody_mask":       (T_frames,),             # bool
         }
     
     Raw embeddings (before projection) are saved because:
@@ -268,6 +271,7 @@ def extract_and_cache_embeddings(
     """
     from f5_tts.model.speaker_encoder import SpeakerEncoder
     from f5_tts.model.emotion_encoder import EmotionEncoder
+    from f5_tts.model.prosody_encoder import ProsodyEncoder
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -293,6 +297,12 @@ def extract_and_cache_embeddings(
         backend=emotion_backend,
         output_dim=emotion_dim,
         frame_level=True,
+        device=device,
+    ).to(device).eval()
+
+    print(f"Loading prosody encoder: {prosody_backend}...")
+    prosody_enc = ProsodyEncoder(
+        backend=prosody_backend,
         device=device,
     ).to(device).eval()
     
@@ -328,6 +338,11 @@ def extract_and_cache_embeddings(
                 emo_global_raw, emo_frame_raw = emotion_enc.extract_raw(audio, sr=sr)
                 # emo_global_raw: (1, emotion_raw_dim) e.g. (1, 768)
                 # emo_frame_raw:  (1, T_frames, emotion_raw_dim)
+
+                # Prosody features (F0 + energy + voicing)
+                prosody_raw, prosody_mask = prosody_enc.extract_raw(audio, sr=sr)
+                # prosody_raw:  (1, T_frames, 5)
+                # prosody_mask: (1, T_frames) bool
             
             # Save
             save_dict = {
@@ -336,6 +351,8 @@ def extract_and_cache_embeddings(
             }
             if emo_frame_raw is not None:
                 save_dict["emotion_frame_raw"] = emo_frame_raw.squeeze(0).cpu()
+            save_dict["prosody_raw"] = prosody_raw.squeeze(0).cpu()
+            save_dict["prosody_mask"] = prosody_mask.squeeze(0).cpu()
             
             torch.save(save_dict, out_path)
             success += 1
@@ -351,6 +368,8 @@ def extract_and_cache_embeddings(
                 "speaker_raw": torch.zeros(speaker_enc.raw_dim),
                 "emotion_global_raw": torch.zeros(emotion_enc.raw_dim),
                 "emotion_frame_raw": None,
+                "prosody_raw": None,
+                "prosody_mask": None,
             }, out_path)
             failed += 1
     
@@ -363,6 +382,8 @@ def extract_and_cache_embeddings(
         "speaker_raw_dim": speaker_enc.raw_dim,
         "emotion_backend": emotion_backend,
         "emotion_raw_dim": emotion_enc.raw_dim,
+        "prosody_backend": prosody_backend,
+        "prosody_raw_dim": 5,
         "success": success,
         "failed": failed,
     }
@@ -534,6 +555,8 @@ def main():
                         choices=["wavlm_sv", "ecapa_tdnn", "resemblyzer"])
     parser.add_argument("--emotion_backend", type=str, default="emotion2vec_base",
                         choices=["emotion2vec_base", "emotion2vec_plus", "wav2vec2_ser", "hubert_ser"])
+    parser.add_argument("--prosody_backend", type=str, default="dio",
+                        choices=["dio", "harvest", "crepe"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--resume", action="store_true", default=True)
     
@@ -554,6 +577,7 @@ def main():
             ds_dir, emb_dir,
             speaker_backend=args.speaker_backend,
             emotion_backend=args.emotion_backend,
+            prosody_backend=args.prosody_backend,
             device=args.device,
             resume=args.resume,
         )

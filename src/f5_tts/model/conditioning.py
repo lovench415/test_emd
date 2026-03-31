@@ -76,7 +76,10 @@ class ConditioningCrossAttention(nn.Module):
         attn_mask = bias.masked_fill(~cond_mask[:, None, None, :], float("-inf"))
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(B, -1, self.heads * self.dim_head)
-        residual = torch.tanh(self.gate) * self.to_out(out)
+        # Gate floor 0.05: projection always gets ≥5% gradient even if model
+        # tries to shut gate down (which happens when projection outputs are
+        # still random/noisy during early training).
+        residual = torch.tanh(self.gate).clamp(min=0.05) * self.to_out(out)
         residual = residual * row_has_cond[:, None, None].to(residual.dtype)
         if x_mask is not None:
             residual = residual * x_mask[..., None].to(residual.dtype)
@@ -146,7 +149,7 @@ class _FusionCrossAttn(nn.Module):
             bias = None
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         out = out.transpose(1, 2).reshape(B, -1, self.heads * self.dim_head)
-        residual = torch.tanh(self.gate) * self.to_out(out)
+        residual = torch.tanh(self.gate).clamp(min=0.05) * self.to_out(out)
         # Zero residual for rows with no valid conditioning (prevents NaN leak)
         if row_has_cond is not None:
             residual = residual * row_has_cond[:, None, None].to(residual.dtype)
@@ -594,7 +597,7 @@ class ConditioningAggregator(nn.Module):
                 if drop_prosody is not None:
                     dp_mask = _expand_bool_mask(drop_prosody, batch, pg_emb.device)
                     pg_emb = pg_emb * (~dp_mask[:, None]).to(pg_emb.dtype)
-                fused = fused + torch.tanh(self.prosody_global_gate) * pg_emb
+                fused = fused + torch.tanh(self.prosody_global_gate).clamp(min=0.05) * pg_emb
             if self.use_adaln:
                 adaln = self.adaln_cond(fused, present_mask=fused_present)
 

@@ -50,7 +50,7 @@ class ConditioningCrossAttention(nn.Module):
         # are zero-init, so gate=0 blocks ALL gradient to them → they never learn →
         # emotion/prosody cross-attention stays dead forever.
         # 0.02 passes 2% of gradient → projections learn → cross-attn activates.
-        self.gate = nn.Parameter(torch.tensor(0.02))
+        self.gate = nn.Parameter(torch.full((1,), 0.02))
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor, cond_mask: torch.Tensor | None = None, x_mask: torch.Tensor | None = None) -> torch.Tensor:
         B = x.shape[0]
@@ -116,7 +116,7 @@ class _FusionCrossAttn(nn.Module):
         # proj=zero so no random noise at start; gate=0.02 provides gradient for proj.
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
-        self.gate = nn.Parameter(torch.tensor(0.02))
+        self.gate = nn.Parameter(torch.full((1,), 0.02))
 
     def forward(self, x, cond, cond_mask=None, x_mask=None):
         B = x.shape[0]
@@ -222,6 +222,7 @@ class ConditioningAggregator(nn.Module):
         prosody_cross_attn_layers: list[int] | None = None,
         prosody_cross_attn_heads: int = 8,
         prosody_cross_attn_dim_head: int = 64,
+        prosody_direct_layers: list[int] | None = None,
     ):
         super().__init__()
         self.speaker_dim = speaker_dim
@@ -239,18 +240,17 @@ class ConditioningAggregator(nn.Module):
             nn.Sequential(nn.Linear(emotion_raw_dim, emotion_dim), nn.SiLU(), nn.Linear(emotion_dim, emotion_dim))
             if emotion_raw_dim else None
         )
-        if self.frame_raw_proj is not None:
-            nn.init.zeros_(self.frame_raw_proj[-1].weight)
-            nn.init.zeros_(self.frame_raw_proj[-1].bias)
+        # NOTE: frame_raw_proj uses default (Kaiming) init, NOT zero-init.
+        # Output is L2-normalized in forward() → bounded magnitude.
+        # Cross-attention gate=0.02 → residual starts at ~0.02 × unit.
+        # Zero-init here killed gradient bootstrap: proj(raw)=0 → gate×0=0 → dead.
 
         # Prosody cross-attention projection: raw (5-dim) → prosody_dim for K/V
         self.prosody_raw_proj = (
             nn.Sequential(nn.Linear(prosody_raw_dim, prosody_dim), nn.SiLU(), nn.Linear(prosody_dim, prosody_dim))
             if prosody_raw_dim else None
         )
-        if self.prosody_raw_proj is not None:
-            nn.init.zeros_(self.prosody_raw_proj[-1].weight)
-            nn.init.zeros_(self.prosody_raw_proj[-1].bias)
+        # Same: Kaiming init is safe because L2 norm + gate=0.02 bound the output.
 
         # Prosody direct addition: raw → model_dim, added to hidden state every block.
         # Init: proj=zero (no noise), gate=0.02 (provides gradient for proj).
@@ -274,14 +274,20 @@ class ConditioningAggregator(nn.Module):
             if prosody_raw_dim else None
         )
 
-        # Per-block gate: small positive (0.02) so proj receives gradient via gate.
+        # Prosody direct: apply at SUBSET of blocks (not all 22) to match
+        # cross-attention's gradient budget. Default = same as prosody_cross_attn.
+        # Per-block gates stored for ALL n_blocks (checkpoint compat); only
+        # gates at active layers receive gradient.
         if prosody_raw_dim:
+            if prosody_direct_layers is None:
+                prosody_direct_layers = prosody_cross_attn_layers or list(range(2, n_blocks, 4))
+            self.prosody_direct_layers = set(prosody_direct_layers)
             self.prosody_block_gates = nn.Parameter(torch.full((n_blocks,), 0.02))
 
         # Prosody global → AdaLN: 9-dim stats (mean/std pitch, voicing ratio,
         # energy stats, delta stats, utterance length, absolute pitch) projected
         # to model_dim and added to the fused speaker+emotion vector before AdaLN.
-        PROSODY_GLOBAL_DIM = 9
+        PROSODY_GLOBAL_DIM = 11
         self.prosody_global_proj = (
             nn.Sequential(
                 nn.Linear(PROSODY_GLOBAL_DIM, model_dim),
@@ -293,7 +299,7 @@ class ConditioningAggregator(nn.Module):
         if self.prosody_global_proj is not None:
             nn.init.zeros_(self.prosody_global_proj[-1].weight)
             nn.init.zeros_(self.prosody_global_proj[-1].bias)
-            self.prosody_global_gate = nn.Parameter(torch.tensor(0.02))
+            self.prosody_global_gate = nn.Parameter(torch.full((1,), 0.02))
 
         self.fusion = nn.Sequential(nn.Linear(speaker_dim + emotion_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim))
         nn.init.zeros_(self.fusion[-1].weight)
@@ -409,38 +415,44 @@ class ConditioningAggregator(nn.Module):
         prosody_raw: torch.Tensor,
         prosody_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute 9-dim global prosody statistics from frame-level raw features.
+        """Compute 11-dim global prosody statistics from frame-level raw features.
 
-        Features (all z-scored or ratio-scaled for stable MLP input):
+        Features:
             0: mean_log_f0        — average pitch (voiced, normalized)
             1: std_log_f0         — pitch variability / range
             2: voicing_ratio      — fraction of voiced frames (speaking density)
             3: mean_log_energy    — average loudness
             4: std_log_energy     — loudness variability
-            5: mean_abs_delta_f0  — pitch movement speed (intonation complexity)
+            5: mean_abs_delta_f0  — pitch movement speed
             6: mean_abs_delta_e   — energy movement speed
-            7: log_total_frames   — utterance length context (log-scaled)
-            8: mean_abs_f0        — absolute pitch level (preserves speaker register)
+            7: log_total_frames   — utterance length context
+            8: mean_abs_f0        — absolute pitch level
+            9: mean_local_rate    — average local speaking rate
+            10: std_local_rate    — rate variability (rhythm regularity)
 
-        Stat 8 uses channel 5 (log_f0_absolute) — the un-normalized absolute
-        log pitch.  This is critical for voice cloning: without it, the model
-        cannot distinguish a 100Hz male from a 250Hz female, because stats 0-1
-        are computed from the z-normalized contour.
+        Stats 9-10 capture speaking rhythm: consistent rate (low std) vs
+        bursty speech with pauses (high std). Uses channel 6 (local_rate).
         """
         mask_f = prosody_mask.float()
         n_valid = mask_f.sum(dim=1).clamp(min=1)
 
-        log_f0 = prosody_raw[..., 0]         # normalized
+        log_f0 = prosody_raw[..., 0]
         voicing = prosody_raw[..., 1]
         log_energy = prosody_raw[..., 2]
         delta_f0 = prosody_raw[..., 3]
         delta_energy = prosody_raw[..., 4]
 
-        # Channel 5 may not exist in old 5-dim caches → safe fallback
+        # Channel 5 may not exist in old 5-dim caches
         if prosody_raw.shape[-1] > 5:
-            log_f0_abs = prosody_raw[..., 5]  # absolute (un-normalized)
+            log_f0_abs = prosody_raw[..., 5]
         else:
-            log_f0_abs = log_f0               # fallback: use normalized
+            log_f0_abs = log_f0
+
+        # Channel 6 may not exist in old 5/6-dim caches
+        if prosody_raw.shape[-1] > 6:
+            local_rate = prosody_raw[..., 6]
+        else:
+            local_rate = voicing  # fallback: voicing ≈ binary rate
 
         voiced_f = ((voicing > 0.5) & prosody_mask).float()
         n_voiced = voiced_f.sum(dim=1).clamp(min=1)
@@ -453,16 +465,17 @@ class ConditioningAggregator(nn.Module):
         mean_abs_delta_f0 = (delta_f0.abs() * mask_f).sum(dim=1) / n_valid
         mean_abs_delta_e = (delta_energy.abs() * mask_f).sum(dim=1) / n_valid
         log_total_frames = n_valid.log()
-
-        # Absolute pitch: mean of un-normalized log_f0 over voiced frames
-        # Typical values: ~4.6 (100Hz male) to ~5.5 (250Hz female)
         mean_abs_f0 = (log_f0_abs * voiced_f).sum(dim=1) / n_voiced
+
+        # Local speaking rate stats
+        mean_local_rate = (local_rate * mask_f).sum(dim=1) / n_valid
+        std_local_rate = (((local_rate - mean_local_rate.unsqueeze(1)) * mask_f).pow(2).sum(dim=1) / n_valid).sqrt()
 
         return torch.stack([
             mean_log_f0, std_log_f0, voicing_ratio, mean_log_energy,
             std_log_energy, mean_abs_delta_f0, mean_abs_delta_e,
-            log_total_frames, mean_abs_f0,
-        ], dim=1)  # (B, 9)
+            log_total_frames, mean_abs_f0, mean_local_rate, std_local_rate,
+        ], dim=1)  # (B, 11)
 
     def project_model_conditions(
         self,
@@ -656,16 +669,23 @@ class ConditioningAggregator(nn.Module):
                 x = torch.utils.checkpoint.checkpoint(self.prosody_cross_attns[key], x, prosody_cond, prosody_mask, x_mask, use_reentrant=False)
             else:
                 x = self.prosody_cross_attns[key](x, prosody_cond, cond_mask=prosody_mask, x_mask=x_mask)
-        # Prosody direct addition — gated per block, scaled by 1/n_blocks.
-        # Without scaling, the SAME prosody_direct tensor is added at all 22 blocks,
-        # so total contribution = sum(gates) × ||pd|| ≈ 22 × gate_mean.
-        # Cross-attention adds DIFFERENT vectors (via attention) at only 5-6 blocks.
-        # This 22/5 asymmetry causes prosody_direct to dominate and suppress
-        # other conditioning paths. Dividing by n_blocks bounds the total
-        # contribution to ~gate_mean (comparable to cross-attn).
-        if prosody_direct is not None and hasattr(self, 'prosody_block_gates'):
-            n_blocks = self.prosody_block_gates.shape[0]
-            gate = torch.tanh(self.prosody_block_gates[block_idx]) / n_blocks
+        # Prosody direct addition — only at selected blocks, hard budget cap.
+        #
+        # Previous design: applied at ALL 22 blocks with per-block gates.
+        # Result: 22 correlated gates all saturated → direct dominated 10×
+        # over cross-attn → cross-attn/fusion/global gates stayed dead.
+        #
+        # Fix: apply at same blocks as prosody_cross_attn (~5 blocks).
+        # With MAX_DIRECT_SCALE=0.1 and n_active=5:
+        #   per_block_max = 0.1 × tanh(saturated) / 5 = 0.015
+        #   total_max = 5 × 0.015 = 0.076
+        # Comparable to cross-attn total (~0.02-0.1 when trained).
+        if (prosody_direct is not None
+                and hasattr(self, 'prosody_block_gates')
+                and block_idx in self.prosody_direct_layers):
+            MAX_DIRECT_SCALE = 0.1
+            n_active = len(self.prosody_direct_layers)
+            gate = MAX_DIRECT_SCALE * torch.tanh(self.prosody_block_gates[block_idx]) / n_active
             # Align lengths (prosody_direct may differ by 1-2 frames from x)
             pd = prosody_direct
             if pd.shape[1] < x.shape[1]:

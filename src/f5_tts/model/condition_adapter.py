@@ -35,16 +35,37 @@ class ConditionAdapter:
         return emotion_frame, emotion_frame_mask
 
     def align_prosody(self, prosody_raw, prosody_mask, target_len):
-        """Align prosody frame features to target sequence length."""
+        """Align prosody frame features to target sequence length.
+
+        Unlike emotion (which can be safely interpolated because emotional
+        state is roughly constant across nearby frames), prosody encodes
+        precise temporal structure: F0 at frame N means "pitch at time N".
+        Interpolating 300 → 600 frames would shift pitch peaks to wrong
+        positions and create artificial patterns.
+
+        Instead: pad with zeros (shorter) or truncate (longer).
+        The mask ensures only real frames affect cross-attention and
+        prosody_global stats. Direct path gets zeros for padded frames.
+        """
         if prosody_raw is None:
             return None, None
-        if prosody_raw.shape[1] != target_len:
-            prosody_raw = interpolate_temporal(prosody_raw, target_len)
+        cur_len = prosody_raw.shape[1]
+        if cur_len < target_len:
+            # Pad with zeros — generated frames get no prosody signal
+            prosody_raw = F.pad(prosody_raw, (0, 0, 0, target_len - cur_len))
+            if prosody_mask is not None:
+                prosody_mask = F.pad(prosody_mask, (0, target_len - cur_len), value=False)
+            else:
+                # Build mask: True for original frames, False for padding
+                prosody_mask = torch.zeros(prosody_raw.shape[0], target_len,
+                                           dtype=torch.bool, device=prosody_raw.device)
+                prosody_mask[:, :cur_len] = True
+        elif cur_len > target_len:
+            prosody_raw = prosody_raw[:, :target_len, :]
+            if prosody_mask is not None:
+                prosody_mask = prosody_mask[:, :target_len]
+        # Apply mask to features
         if prosody_mask is not None:
-            mask_f = prosody_mask.float().unsqueeze(1)
-            if mask_f.shape[-1] != target_len:
-                mask_f = F.interpolate(mask_f, size=target_len, mode="nearest")
-            prosody_mask = mask_f.squeeze(1).bool()
             prosody_raw = prosody_raw * prosody_mask[..., None].to(prosody_raw.dtype)
         return prosody_raw, prosody_mask
 

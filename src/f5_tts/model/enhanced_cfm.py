@@ -293,6 +293,18 @@ class EnhancedCFM(nn.Module):
         use_expression_cfg = use_emo_cfg or use_pros_cfg
 
         # Pre-build all conditioning runtimes ONCE before the ODE loop.
+        #
+        # CRITICAL: mask prosody_direct to reference region only.
+        # At inference, prosody is extracted from reference audio and interpolated
+        # to target_len. The reference region has real F0 data; the generation
+        # region has interpolated garbage. Cross-attention adapts via attention
+        # weights, but direct addition has no such mechanism — it blindly adds
+        # fake prosody to generated frames, distorting the output.
+        # Training is unaffected (prosody covers the full utterance there).
+        if model_conditions is not None and model_conditions.prosody_direct is not None:
+            ref_region = cond_mask.unsqueeze(-1).to(model_conditions.prosody_direct.dtype)
+            model_conditions.prosody_direct = model_conditions.prosody_direct * ref_region
+
         cond_runtime = self._build_conditioning_runtime(model_conditions) if model_conditions is not None else None
         uncond_runtime = self._build_conditioning_runtime(uncond_conditions) if uncond_conditions is not None else None
 

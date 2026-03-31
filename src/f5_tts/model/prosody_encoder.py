@@ -22,7 +22,7 @@ import torch.nn.functional as F
 import numpy as np
 
 
-PROSODY_RAW_DIM = 6  # log_f0, voicing, log_energy, delta_f0, delta_energy, log_f0_absolute
+PROSODY_RAW_DIM = 7  # log_f0, voicing, log_energy, delta_f0, delta_energy, log_f0_absolute, local_rate
 
 
 class ProsodyEncoder:
@@ -204,7 +204,7 @@ class ProsodyEncoder:
 
     def _build_features(self, f0: np.ndarray, energy: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Build 6-dim feature vector from raw F0 and energy.
+        Build 7-dim feature vector from raw F0 and energy.
 
         Features:
             0: log_f0           — log-scaled F0, z-normalized per utterance (relative contour)
@@ -213,10 +213,12 @@ class ProsodyEncoder:
             3: delta_f0         — F0 velocity (pitch change rate)
             4: delta_energy     — energy velocity
             5: log_f0_absolute  — log-scaled F0, NOT normalized (absolute pitch level)
+            6: local_rate       — local speaking rate (voicing density in ~200ms window)
 
-        Channel 5 preserves the speaker's absolute pitch range.  Without it,
-        a 100Hz male and 250Hz female would produce identical normalized features.
-        The model uses this to maintain correct pitch register during voice cloning.
+        Channel 6 captures rhythm and pacing: high = fast speech, low = pause/slow.
+        Computed as smoothed voicing density over a sliding window.
+        Together with channels 1-2, the model can learn pause positions,
+        acceleration/deceleration patterns, and phrase-level rhythm.
         """
         n = len(f0)
         voiced = f0 > 0
@@ -246,7 +248,23 @@ class ProsodyEncoder:
             delta_f0[1:] = np.diff(log_f0)
             delta_energy[1:] = np.diff(log_energy)
 
-        features = np.stack([log_f0, voicing, log_energy, delta_f0, delta_energy, log_f0_abs], axis=-1)
+        # Local speaking rate: voicing density in sliding window.
+        # Window ~200ms at 24kHz/256hop ≈ 19 frames. Use 15 for efficiency.
+        # High = dense speech (fast), low = pause/silence (slow).
+        # Z-normalized so model sees relative speed changes.
+        win = min(15, max(3, n // 4))
+        if n >= win:
+            kernel = np.ones(win, dtype=np.float32) / win
+            local_rate = np.convolve(voicing, kernel, mode='same').astype(np.float32)
+        else:
+            local_rate = np.full(n, voicing.mean(), dtype=np.float32)
+        # Z-normalize
+        if n > 1:
+            lr_mean = local_rate.mean()
+            lr_std = local_rate.std() + 1e-8
+            local_rate = (local_rate - lr_mean) / lr_std
+
+        features = np.stack([log_f0, voicing, log_energy, delta_f0, delta_energy, log_f0_abs, local_rate], axis=-1)
         mask = np.ones(n, dtype=bool)
 
         return torch.from_numpy(features), torch.from_numpy(mask)

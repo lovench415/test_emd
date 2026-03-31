@@ -30,7 +30,7 @@ class DurationPredictor(nn.Module):
     """Predict speaking rate from prosody + speaker features.
 
     Input:
-        prosody_global: (B, 5) — pooled prosody features
+        prosody_global: (B, 7) — pooled prosody features
         speaker_emb:    (B, speaker_dim) — speaker embedding (optional)
         text_byte_len:  (B,) — text length in bytes (for rate → frames conversion)
 
@@ -41,7 +41,7 @@ class DurationPredictor(nn.Module):
 
     def __init__(
         self,
-        prosody_global_dim: int = 6,
+        prosody_global_dim: int = 7,
         speaker_dim: int = 512,
         hidden_dim: int = 256,
         use_speaker: bool = True,
@@ -84,9 +84,9 @@ class DurationPredictor(nn.Module):
             prosody_mask: (B, T) — valid frame mask
 
         Returns:
-            (B, 6) — mean of each channel over valid frames
+            (B, 7) — mean of each channel over valid frames
         """
-        EXPECTED_DIM = 6  # must match prosody_global_dim passed to __init__
+        EXPECTED_DIM = 7  # must match prosody_global_dim passed to __init__
 
         if prosody_raw is None:
             return torch.zeros(1, EXPECTED_DIM, device=self._device())
@@ -114,7 +114,7 @@ class DurationPredictor(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """
         Args:
-            prosody_global: (B, 5)
+            prosody_global: (B, 7)
             text_byte_len:  (B,) int or float
             speaker_emb:    (B, speaker_dim) optional
 

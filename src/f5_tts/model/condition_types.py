@@ -24,7 +24,7 @@ class ModelConditionBatch:
     emotion_frame: torch.Tensor | None = None
     prosody_frame: torch.Tensor | None = None       # (B, T, prosody_dim) for cross-attn
     prosody_direct: torch.Tensor | None = None       # (B, T, model_dim) for direct addition
-    prosody_global: torch.Tensor | None = None       # (B, 9) global prosody stats for AdaLN
+    prosody_global: torch.Tensor | None = None       # (B, 11) global prosody stats for AdaLN
     speaker_present: torch.Tensor | None = None
     emotion_global_present: torch.Tensor | None = None
     emotion_frame_mask: torch.Tensor | None = None

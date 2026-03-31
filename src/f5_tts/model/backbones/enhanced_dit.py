@@ -91,6 +91,7 @@ class EnhancedDiT(nn.Module):
         prosody_cross_attn_layers: list[int] | None = None,
         prosody_cross_attn_heads: int = 8,
         prosody_cross_attn_dim_head: int = 64,
+        prosody_direct_layers: list[int] | None = None,
     ):
         super().__init__()
         self.dim = dim
@@ -120,6 +121,7 @@ class EnhancedDiT(nn.Module):
             prosody_cross_attn_layers=prosody_cross_attn_layers,
             prosody_cross_attn_heads=prosody_cross_attn_heads,
             prosody_cross_attn_dim_head=prosody_cross_attn_dim_head,
+            prosody_direct_layers=prosody_direct_layers,
         )
         self._init_weights()
 

@@ -112,7 +112,7 @@ def parse_args():
     g.add_argument("--no_input_add", action="store_true")
 
     g = p.add_argument_group("prosody")
-    g.add_argument("--prosody_backend", default="dio", choices=["dio", "harvest", "crepe"])
+    g.add_argument("--prosody_backend", default="dio", choices=["dio", "harvest", "crepe", "rmvpe"])
     g.add_argument("--prosody_dim", type=int, default=256)
     g.add_argument("--no_prosody", action="store_true", help="Disable prosody conditioning")
 

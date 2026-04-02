@@ -556,7 +556,7 @@ def main():
     parser.add_argument("--emotion_backend", type=str, default="emotion2vec_base",
                         choices=["emotion2vec_base", "emotion2vec_plus", "wav2vec2_ser", "hubert_ser"])
     parser.add_argument("--prosody_backend", type=str, default="dio",
-                        choices=["dio", "harvest", "crepe"])
+                        choices=["dio", "harvest", "crepe", "rmvpe"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--resume", action="store_true", default=True)
     

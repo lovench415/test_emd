@@ -153,8 +153,7 @@ class ProsodyEncoder:
                 f0, energy = self._extract_crepe(wav[i:i+1], sr, device)
             else:
                 f0, energy = self._extract_rmvpe_plus(wav[i:i+1], sr, device)
-                print(f0)
-                print(energy)
+                
 
             features, mask = self._build_features(f0, energy)
             batch_features.append(features)

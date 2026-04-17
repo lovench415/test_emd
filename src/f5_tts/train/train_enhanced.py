@@ -92,8 +92,10 @@ def parse_args():
                    help="LR multiplier for unfrozen DiT blocks (× base LR). "
                         "Lower = safer for pretrained weights.")
     g.add_argument("--lr_prosody_mult", type=float, default=2.0,
-                   help="LR multiplier for prosody modules (× base LR). "
-                        "Higher = faster cold-start for new prosody pathway.")
+                   help="LR multiplier for prosody direct/global modules (× base LR).")
+    g.add_argument("--lr_cross_attn_mult", type=float, default=2.0,
+                   help="LR multiplier for cross-attention modules (emotion + prosody "
+                        "frame-level paths). Higher = faster learning for the slowest pathway.")
     g.add_argument("--lr_duration_mult", type=float, default=1.0,
                    help="LR multiplier for duration predictor (× base LR).")
 
@@ -265,26 +267,46 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
     """Build optimizer parameter groups with differential learning rates.
 
     Groups (from highest to lowest LR):
-        prosody:      prosody-specific modules (cold start, needs fast LR)
-        conditioning: cond_aggregator excluding prosody (speaker/emotion, near-converged)
+        cross_attn:   frame-level cross-attention paths (emotion + prosody)
+                      Slowest to learn — deep attention chain needs high LR.
+        prosody:      prosody direct/global modules (fast learners)
+        conditioning: speaker/emotion global projections, AdaLN, fusion, input_add
         duration:     duration predictor (separate task)
-        base:         unfrozen DiT blocks (pretrained, needs conservative LR)
+        base:         unfrozen DiT blocks (pretrained, conservative LR)
 
     All LRs are multiples of args.learning_rate.
     """
     lr = args.learning_rate
 
     # Collect parameter id sets for each group
+    cross_attn_ids = set()
     prosody_ids = set()
     base_ids = set()
     duration_ids = set()
 
     agg = model.transformer.cond_aggregator
 
-    # Prosody-specific parameters inside cond_aggregator
+    # Cross-attention group: frame-level attention paths (slowest learners)
+    # Includes both emotion and prosody cross-attn + their input projections
+    cross_attn_module_names = [
+        "cross_attns",           # emotion cross-attention (ModuleDict)
+        "prosody_cross_attns",   # prosody cross-attention (ModuleDict)
+        "frame_raw_proj",        # emotion frame input projection
+        "prosody_raw_proj",      # prosody frame input projection
+        "emo_prosody_fusion",    # bidirectional fusion between emotion/prosody frames
+    ]
+    for name in cross_attn_module_names:
+        mod = getattr(agg, name, None)
+        if mod is not None:
+            if isinstance(mod, nn.Parameter):
+                cross_attn_ids.add(id(mod))
+            else:
+                for p in mod.parameters():
+                    cross_attn_ids.add(id(p))
+
+    # Prosody group: direct addition + global stats (fast learners, already working)
     prosody_module_names = [
-        "prosody_raw_proj", "prosody_direct_proj", "prosody_temporal_smooth",
-        "prosody_cross_attns", "prosody_global_proj", "emo_prosody_fusion",
+        "prosody_direct_proj", "prosody_temporal_smooth", "prosody_global_proj",
     ]
     for name in prosody_module_names:
         mod = getattr(agg, name, None)
@@ -294,7 +316,7 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
             else:
                 for p in mod.parameters():
                     prosody_ids.add(id(p))
-    # Scalar gates
+    # Scalar gates for prosody
     for attr in ("prosody_block_gates", "prosody_global_gate"):
         p = getattr(agg, attr, None)
         if p is not None and isinstance(p, nn.Parameter):
@@ -318,21 +340,25 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
                     base_ids.add(id(p))
 
     # Build groups — each trainable param in exactly one group
-    prosody_params, cond_params, dur_params, base_params = [], [], [], []
+    cross_attn_params, prosody_params, cond_params, dur_params, base_params = [], [], [], [], []
     for p in model.parameters():
         if not p.requires_grad:
             continue
         pid = id(p)
-        if pid in prosody_ids:
+        if pid in cross_attn_ids:
+            cross_attn_params.append(p)
+        elif pid in prosody_ids:
             prosody_params.append(p)
         elif pid in duration_ids:
             dur_params.append(p)
         elif pid in base_ids:
             base_params.append(p)
         else:
-            cond_params.append(p)  # everything else (speaker/emotion conditioning, mel_spec if trainable)
+            cond_params.append(p)
 
     groups = []
+    if cross_attn_params:
+        groups.append({"params": cross_attn_params, "lr": lr * args.lr_cross_attn_mult, "name": "cross_attn"})
     if cond_params:
         groups.append({"params": cond_params, "lr": lr, "name": "conditioning"})
     if prosody_params:

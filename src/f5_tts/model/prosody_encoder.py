@@ -6,10 +6,10 @@ Unlike emotion2vec (trained for emotion classification), this directly
 captures pitch melody, rhythm, and stress patterns.
 
 Backends:
-    "dio"      — pyworld DIO (fast, CPU, good quality)
-    "harvest"  — pyworld Harvest (slower, most accurate F0)
-    "crepe"    — torchcrepe (GPU, neural F0, best for noisy audio)
-    "rmvpe+"   — RMVPE/RMVPE+ style neural F0 backend (optional, if installed)
+    "dio"     — pyworld DIO (fast, CPU, good quality)
+    "harvest" — pyworld Harvest (slower, most accurate F0)
+    "crepe"   — torchcrepe (GPU, neural F0, best for noisy audio)
+    "rmvpe"   — RMVPE (GPU, robust neural F0, best overall quality)
 
 This module is extraction-only — no trainable parameters.
 All projection and smoothing happens in ConditioningAggregator
@@ -30,7 +30,7 @@ class ProsodyEncoder:
     """
     Raw waveform → frame-level prosody features.
 
-    Output: (B, T_frames, 6) — log_f0, voicing, log_energy, Δf0, Δenergy, log_f0_absolute.
+    Output: (B, T_frames, 7) — log_f0, voicing, log_energy, Δf0, Δenergy, log_f0_absolute.
     First 5 features are normalized to ~zero mean, unit variance.
     Channel 5 (log_f0_absolute) preserves absolute pitch for voice cloning.
 
@@ -47,6 +47,7 @@ class ProsodyEncoder:
         f0_ceil: float = 800.0,
         device: str = "cpu",
         output_dim: int | None = None,  # accepted for API compat, not used (no trainable params)
+        rmvpe_model_path: str | None = None,  # path to rmvpe.pt (auto-downloads if None)
     ):
         self.backend = backend
         self.hop_length = hop_length
@@ -55,6 +56,8 @@ class ProsodyEncoder:
         self.f0_ceil = f0_ceil
         self.raw_dim = PROSODY_RAW_DIM
         self.device = device
+        self.rmvpe_model_path = rmvpe_model_path
+        self._rmvpe_model = None
         self._validate_backend(backend)
 
     def _validate_backend(self, backend: str):
@@ -69,10 +72,7 @@ class ProsodyEncoder:
             except ImportError:
                 raise ImportError("torchcrepe required for 'crepe' backend: pip install torchcrepe")
         elif backend == "rmvpe":
-            try:
-                from f5_tts.model.RMVPE import RMVPE0Predictor
-            except ImportError:
-                raise ImportError("RMVPE required for 'rmvpe' backend")
+            pass  # RMVPE model loaded lazily on first use
         else:
             raise ValueError(f"Unknown prosody backend: {backend!r}. Choose from: dio, harvest, crepe, rmvpe")
 
@@ -92,31 +92,6 @@ class ProsodyEncoder:
 
     def parameters(self):
         return iter([])
-
-    def _probe_rmvpe_plus_backend(self):
-        last_err = None
-        for mod_name in ("rmvpe", "rmvpe_torch", "rmvpe_plus"):
-            try:
-                __import__(mod_name)
-                return
-            except Exception as e:  # pragma: no cover - import probing
-                last_err = e
-        raise ImportError(
-            "RMVPE+ backend selected but no supported package was found. "
-            "Install one of: rmvpe, rmvpe_torch, or rmvpe_plus."
-        ) from last_err
-
-    def _load_rmvpe_plus_model(self):
-
-        from huggingface_hub import hf_hub_download
-
-        REPO_ID = "IAHispano/Applio"
-        FILENAME = "Resources/rmvpe.pt"
-
-        model = hf_hub_download(repo_id=REPO_ID, filename=FILENAME)
-
-        self._rmvpe_plus_model = model
-        return model
 
     # ── Raw feature extraction ────────────────────────────────────────
 
@@ -151,9 +126,10 @@ class ProsodyEncoder:
                 f0, energy = self._extract_pyworld(audio_np, sr)
             elif self.backend == "crepe":
                 f0, energy = self._extract_crepe(wav[i:i+1], sr, device)
+            elif self.backend == "rmvpe":
+                f0, energy = self._extract_rmvpe(wav[i:i+1], sr, device)
             else:
-                f0, energy = self._extract_rmvpe_plus(wav[i:i+1], sr, device)
-                
+                raise ValueError(f"Unknown backend: {self.backend}")
 
             features, mask = self._build_features(f0, energy)
             batch_features.append(features)
@@ -236,46 +212,75 @@ class ProsodyEncoder:
 
         return f0, energy
 
-    def _extract_rmvpe_plus(self, wav_tensor: torch.Tensor, sr: int, device) -> tuple[np.ndarray, np.ndarray]:
-        """Extract F0 using an installed RMVPE/RMVPE+ backend; energy from waveform."""
+    def _load_rmvpe(self, device):
+        """Lazily load RMVPE model."""
+        if self._rmvpe_model is not None:
+            return self._rmvpe_model
+
+        from f5_tts.model.RMVPE import RMVPE0Predictor as RMVPE
+
+        model_path = self.rmvpe_model_path
+        if model_path is None:
+            from huggingface_hub import hf_hub_download
+
+            REPO_ID = "lj1995/VoiceConversionWebUI"
+            FILENAME = "rmvpe.pt"
+
+            model_path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME)
+            if model_path is None:
+                raise FileNotFoundError(
+                    "RMVPE model not found. Download rmvpe.pt from "
+                    "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt "
+                    "and place in current directory, models/, or ~/.cache/rmvpe/"
+                )
+
+        self._rmvpe_model = RMVPE(model_path, device=device)
+        return self._rmvpe_model
+
+    def _extract_rmvpe(self, wav_tensor: torch.Tensor, sr: int, device) -> tuple[np.ndarray, np.ndarray]:
+        """Extract F0 using RMVPE (robust neural pitch), energy from waveform."""
         import torchaudio
-        from f5_tts.model.RMVPE import RMVPE0Predictor
-        model = self._load_rmvpe_plus_model()
-        wav = wav_tensor.to(device)
-        target_sr = getattr(model, "sample_rate", 16000)
-        if sr != target_sr:
-            wav = torchaudio.transforms.Resample(sr, target_sr).to(device)(wav)
-            hop = int(self.hop_length * target_sr / sr)
-        else:
-            hop = self.hop_length
 
-        model_rmvpe = RMVPE0Predictor(
-            model,
-            device=device,
-            # hop_length=80
-        )
-        f0 = model_rmvpe.infer_from_audio(wav, thred=0.03)
+        hop = self.hop_length
 
+        # RMVPE expects 16kHz mono
+        wav_16k = wav_tensor.to(device)
+        if sr != 16000:
+            wav_16k = torchaudio.transforms.Resample(sr, 16000).to(device)(wav_16k)
 
-        if isinstance(f0, torch.Tensor):
-            f0 = f0.detach().float().cpu().numpy()
-        else:
-            f0 = np.asarray(f0, dtype=np.float32)
-        f0 = np.squeeze(f0)
-        if f0.ndim != 1:
-            f0 = f0.reshape(-1)
+        model = self._load_rmvpe(device)
 
+        # RMVPE returns F0 at its own hop (160 samples at 16kHz = 10ms)
+        # We need to resample to our hop_length
+        wav_16k_np = wav_16k.squeeze().cpu().float().numpy()
+        f0_rmvpe = model.infer_from_audio(wav_16k_np, thred=0.03)
+        # f0_rmvpe: numpy array, (T_rmvpe,)
+
+        # Resample F0 to match our hop_length
         audio_np = wav_tensor.squeeze().cpu().float().numpy()
+        n_frames_target = len(audio_np) // hop + 1
+        if len(f0_rmvpe) != n_frames_target:
+            # Interpolate to target frame count
+            f0_interp = np.interp(
+                np.linspace(0, 1, n_frames_target),
+                np.linspace(0, 1, len(f0_rmvpe)),
+                f0_rmvpe,
+            )
+            f0 = f0_interp
+        else:
+            f0 = f0_rmvpe
+
+        # Energy: RMS per frame (same as pyworld path)
         n_frames = len(f0)
         energy = np.zeros(n_frames, dtype=np.float64)
         for j in range(n_frames):
-            start = j * self.hop_length
-            end = min(start + self.hop_length, len(audio_np))
+            start = j * hop
+            end = min(start + hop, len(audio_np))
             if start < len(audio_np):
                 frame = audio_np[start:end]
                 energy[j] = np.sqrt(np.mean(frame ** 2) + 1e-8)
 
-        return f0, energy
+        return f0.astype(np.float64), energy
 
     def _build_features(self, f0: np.ndarray, energy: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """

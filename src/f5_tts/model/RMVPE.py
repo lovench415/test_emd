@@ -436,7 +436,7 @@ class RMVPE0Predictor:
         self.resample_kernel = {}
         self.device = device
         self.mel_extractor = MelSpectrogram(
-            N_MELS, 16000, 1024, 160, None, 30, 8000
+            N_MELS, 16000, 1024, 160, 1024, 30, 8000
         ).to(device)
         self.model = self.model.to(device)
         cents_mapping = 20 * np.arange(N_CLASS) + 1997.3794084376191
@@ -502,7 +502,8 @@ class RMVPE0Predictor:
             audio (np.ndarray): Audio signal.
             thred (float, optional): Threshold for salience. Defaults to 0.03.
         """
-        #audio = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
+
+        audio = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
         mel = self.mel_extractor(audio, center=True)
         del audio
         with torch.no_grad():

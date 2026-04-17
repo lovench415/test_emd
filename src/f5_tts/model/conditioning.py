@@ -46,11 +46,10 @@ class ConditioningCrossAttention(nn.Module):
         self.to_k = nn.Linear(cond_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(cond_dim, inner_dim, bias=False)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, model_dim), nn.Dropout(dropout))
-        # Gate=0.02 (not 0): upstream projections (frame_raw_proj, prosody_raw_proj)
-        # are zero-init, so gate=0 blocks ALL gradient to them → they never learn →
-        # emotion/prosody cross-attention stays dead forever.
-        # 0.02 passes 2% of gradient → projections learn → cross-attn activates.
-        self.gate = nn.Parameter(torch.full((1,), 0.02))
+        # Gate=0.15 → tanh(0.15)=0.149: projection gets ~15% gradient from start.
+        # Lower values (0.02) caused cross-attn to stay dead for 22K+ steps
+        # because gradient was too weak for the 6-step attention chain.
+        self.gate = nn.Parameter(torch.full((1,), 0.15))
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor, cond_mask: torch.Tensor | None = None, x_mask: torch.Tensor | None = None) -> torch.Tensor:
         B = x.shape[0]
@@ -76,6 +75,9 @@ class ConditioningCrossAttention(nn.Module):
         attn_mask = bias.masked_fill(~cond_mask[:, None, None, :], float("-inf"))
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(B, -1, self.heads * self.dim_head)
+        # Gate init=0.15 (tanh=0.149): high enough for projection to get
+        # meaningful gradient from the start. clamp(min=) was wrong — it killed
+        # gradient for gate parameter (stuck in clamped region forever).
         residual = torch.tanh(self.gate) * self.to_out(out)
         residual = residual * row_has_cond[:, None, None].to(residual.dtype)
         if x_mask is not None:
@@ -113,10 +115,10 @@ class _FusionCrossAttn(nn.Module):
         self.to_k = nn.Linear(kv_dim, inner, bias=False)
         self.to_v = nn.Linear(kv_dim, inner, bias=False)
         self.to_out = nn.Linear(inner, q_dim)
-        # proj=zero so no random noise at start; gate=0.02 provides gradient for proj.
+        # proj=zero so no random noise; gate=0.15 provides gradient for proj.
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
-        self.gate = nn.Parameter(torch.full((1,), 0.02))
+        self.gate = nn.Parameter(torch.full((1,), 0.15))
 
     def forward(self, x, cond, cond_mask=None, x_mask=None):
         B = x.shape[0]
@@ -242,15 +244,14 @@ class ConditioningAggregator(nn.Module):
         )
         # NOTE: frame_raw_proj uses default (Kaiming) init, NOT zero-init.
         # Output is L2-normalized in forward() → bounded magnitude.
-        # Cross-attention gate=0.02 → residual starts at ~0.02 × unit.
-        # Zero-init here killed gradient bootstrap: proj(raw)=0 → gate×0=0 → dead.
+        # Cross-attention gate=0.15 → residual starts at ~0.15 × unit (safe).
 
-        # Prosody cross-attention projection: raw (5-dim) → prosody_dim for K/V
+        # Prosody cross-attention projection: raw → prosody_dim for K/V
         self.prosody_raw_proj = (
             nn.Sequential(nn.Linear(prosody_raw_dim, prosody_dim), nn.SiLU(), nn.Linear(prosody_dim, prosody_dim))
             if prosody_raw_dim else None
         )
-        # Same: Kaiming init is safe because L2 norm + gate=0.02 bound the output.
+        # Same: Kaiming init, bounded by L2 norm + gate=0.15.
 
         # Prosody direct addition: raw → model_dim, added to hidden state every block.
         # Init: proj=zero (no noise), gate=0.02 (provides gradient for proj).
@@ -299,7 +300,7 @@ class ConditioningAggregator(nn.Module):
         if self.prosody_global_proj is not None:
             nn.init.zeros_(self.prosody_global_proj[-1].weight)
             nn.init.zeros_(self.prosody_global_proj[-1].bias)
-            self.prosody_global_gate = nn.Parameter(torch.full((1,), 0.02))
+            self.prosody_global_gate = nn.Parameter(torch.full((1,), 0.15))
 
         self.fusion = nn.Sequential(nn.Linear(speaker_dim + emotion_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim))
         nn.init.zeros_(self.fusion[-1].weight)

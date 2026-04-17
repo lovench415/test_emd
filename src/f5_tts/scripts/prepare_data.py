@@ -203,13 +203,13 @@ def _load_csv_metadata(path: str) -> list[dict]:
             parts = line.split("|")
             if len(parts) >= 2:
                 entry = {
-                    "audio_path": parts[0].strip(),
-                    "text": parts[1].strip(),
-                }
-                if len(parts) >= 3:
-                    entry["speaker"] = parts[2].strip()
-                entry["language"] = 'ru'
-                entries.append(entry)
+                "audio_path": parts[0].strip(),
+                "text": parts[1].strip(),
+                    }
+            entry["speaker"] = parts[2].strip()
+            entry["language"] = 'ru'
+
+            entries.append(entry)
     return entries
 
 
@@ -304,66 +304,157 @@ def extract_and_cache_embeddings(
     prosody_enc = ProsodyEncoder(
         backend=prosody_backend,
         device=device,
-    ).to(device).eval()
+    )
     
-    # Process each sample
-    success = 0
-    failed = 0
+    # ── Determine which samples to process ──
+    indices = []
     skipped = 0
-    
-    for i in tqdm(range(len(dataset)), desc="Extracting embeddings"):
+    for i in range(len(dataset)):
         out_path = os.path.join(output_dir, f"{i}.pt")
-        
-        # Skip if already computed (resume mode)
         if resume and os.path.exists(out_path):
             skipped += 1
-            continue
-        
+        else:
+            indices.append(i)
+    
+    if skipped:
+        print(f"Skipping {skipped} already-computed embeddings")
+    print(f"Processing {len(indices)} samples...")
+
+    # ── Batched extraction with I/O pipeline ──
+    # GPU encoders (speaker, emotion) benefit from batching.
+    # Prosody (pyworld) is CPU-bound → runs in parallel via ThreadPool.
+    # Audio loading is I/O-bound → prefetched in background.
+    
+    BATCH_SIZE = 8  # GPU batch for speaker/emotion encoders
+    success = 0
+    failed = 0
+
+    from concurrent.futures import ThreadPoolExecutor
+    import queue
+
+    def load_audio(idx):
+        """Load + resample single audio file (runs in thread)."""
         try:
-            row = dataset[i]
-            audio_path = row["audio_path"]
-            
-            # Load audio
-            audio, sr = torchaudio.load(audio_path)
+            row = dataset[idx]
+            audio, sr = torchaudio.load(row["audio_path"])
             if audio.shape[0] > 1:
                 audio = torch.mean(audio, dim=0, keepdim=True)
-            audio = audio.to(device)
-            
-            with torch.no_grad():
-                # Speaker embedding (raw, before projection)
-                spk_raw = speaker_enc.extract_raw(audio, sr=sr)
-                # spk_raw: (1, speaker_raw_dim) e.g. (1, 512)
-                
-                # Emotion embedding (raw, before projection)
-                emo_global_raw, emo_frame_raw = emotion_enc.extract_raw(audio, sr=sr)
-                # emo_global_raw: (1, emotion_raw_dim) e.g. (1, 768)
-                # emo_frame_raw:  (1, T_frames, emotion_raw_dim)
-
-                # Prosody features (F0 + energy + voicing)
-                prosody_raw, prosody_mask = prosody_enc.extract_raw(audio, sr=sr)
-                # prosody_raw:  (1, T_frames, 5)
-                # prosody_mask: (1, T_frames) bool
-            
-            # Save
-            save_dict = {
-                "speaker_raw": spk_raw.squeeze(0).cpu(),
-                "emotion_global_raw": emo_global_raw.squeeze(0).cpu(),
-            }
-            if emo_frame_raw is not None:
-                save_dict["emotion_frame_raw"] = emo_frame_raw.squeeze(0).cpu()
-            save_dict["prosody_raw"] = prosody_raw.squeeze(0).cpu()
-            save_dict["prosody_mask"] = prosody_mask.squeeze(0).cpu()
-            
-            torch.save(save_dict, out_path)
-            success += 1
-            
-            # Free GPU memory periodically
-            if i % 100 == 0:
-                torch.cuda.empty_cache()
-                
+            return idx, audio, sr, None
         except Exception as e:
-            print(f"  [FAIL] Sample {i}: {e}")
-            # Save zeros as fallback (model handles zeros gracefully)
+            return idx, None, None, e
+
+    def extract_prosody_cpu(audio, sr):
+        """Extract prosody on CPU (pyworld/crepe) — can overlap with GPU work."""
+        try:
+            p_raw, p_mask = prosody_enc.extract_raw(audio, sr=sr)
+            return p_raw.squeeze(0).cpu(), p_mask.squeeze(0).cpu()
+        except Exception:
+            return None, None
+
+    # Prefetch audio in background (2 batches ahead)
+    prefetch_q = queue.Queue(maxsize=BATCH_SIZE * 3)
+    
+    def prefetch_worker():
+        for idx in indices:
+            prefetch_q.put(load_audio(idx))
+        prefetch_q.put(None)  # sentinel
+
+    import threading
+    prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
+    prefetch_thread.start()
+
+    # Process in batches
+    batch_data = []  # [(idx, audio, sr), ...]
+    pbar = tqdm(total=len(indices), desc="Extracting embeddings")
+
+    def flush_batch(batch):
+        """Process a batch: GPU encoders batched, prosody parallel on CPU."""
+        nonlocal success, failed
+        if not batch:
+            return
+
+        # 1. Pad audios to same length for batched GPU inference
+        max_len = max(a.shape[-1] for _, a, _ in batch)
+        padded = torch.zeros(len(batch), 1, max_len)
+        for j, (_, audio, _) in enumerate(batch):
+            padded[j, :, :audio.shape[-1]] = audio
+        padded_gpu = padded.to(device)
+
+        # 2. Batched speaker extraction
+        with torch.no_grad():
+            try:
+                spk_raws = speaker_enc.extract_raw(padded_gpu, sr=batch[0][2])
+                # spk_raws: (B, speaker_raw_dim)
+            except Exception:
+                # Fallback to per-sample
+                spk_raws = []
+                for j, (_, audio, sr) in enumerate(batch):
+                    try:
+                        s = speaker_enc.extract_raw(audio.to(device), sr=sr)
+                        spk_raws.append(s.squeeze(0))
+                    except Exception:
+                        spk_raws.append(torch.zeros(speaker_enc.raw_dim))
+                spk_raws = torch.stack(spk_raws)
+
+        # 3. Emotion: per-sample (variable-length frame output)
+        emo_globals, emo_frames = [], []
+        with torch.no_grad():
+            for j, (_, audio, sr) in enumerate(batch):
+                try:
+                    eg, ef = emotion_enc.extract_raw(audio.to(device), sr=sr)
+                    emo_globals.append(eg.squeeze(0).cpu())
+                    emo_frames.append(ef.squeeze(0).cpu() if ef is not None else None)
+                except Exception:
+                    emo_globals.append(torch.zeros(emotion_enc.raw_dim))
+                    emo_frames.append(None)
+
+        # 4. Prosody: parallel on CPU (overlaps with next batch's GPU work)
+        with ThreadPoolExecutor(max_workers=min(4, len(batch))) as pool:
+            prosody_futures = [
+                pool.submit(extract_prosody_cpu, audio, sr)
+                for _, audio, sr in batch
+            ]
+            prosody_results = [f.result() for f in prosody_futures]
+
+        # 5. Save results
+        for j, (idx, _, _) in enumerate(batch):
+            out_path = os.path.join(output_dir, f"{idx}.pt")
+            try:
+                save_dict = {
+                    "speaker_raw": spk_raws[j].cpu() if torch.is_tensor(spk_raws) else spk_raws[j],
+                }
+                save_dict["emotion_global_raw"] = emo_globals[j]
+                if emo_frames[j] is not None:
+                    save_dict["emotion_frame_raw"] = emo_frames[j]
+                p_raw, p_mask = prosody_results[j]
+                save_dict["prosody_raw"] = p_raw
+                save_dict["prosody_mask"] = p_mask
+                torch.save(save_dict, out_path)
+                success += 1
+            except Exception as e:
+                print(f"  [FAIL] Sample {idx}: {e}")
+                torch.save({
+                    "speaker_raw": torch.zeros(speaker_enc.raw_dim),
+                    "emotion_global_raw": torch.zeros(emotion_enc.raw_dim),
+                    "emotion_frame_raw": None,
+                    "prosody_raw": None,
+                    "prosody_mask": None,
+                }, out_path)
+                failed += 1
+            pbar.update(1)
+
+        # Free GPU memory
+        torch.cuda.empty_cache()
+
+    # Main loop: read from prefetch queue, batch, flush
+    while True:
+        item = prefetch_q.get()
+        if item is None:
+            break
+        idx, audio, sr, err = item
+        if err is not None or audio is None:
+            print(f"  [FAIL] Sample {idx}: {err}")
+            out_path = os.path.join(output_dir, f"{idx}.pt")
             torch.save({
                 "speaker_raw": torch.zeros(speaker_enc.raw_dim),
                 "emotion_global_raw": torch.zeros(emotion_enc.raw_dim),
@@ -372,6 +463,18 @@ def extract_and_cache_embeddings(
                 "prosody_mask": None,
             }, out_path)
             failed += 1
+            pbar.update(1)
+            continue
+
+        batch_data.append((idx, audio, sr))
+        if len(batch_data) >= BATCH_SIZE:
+            flush_batch(batch_data)
+            batch_data = []
+
+    # Flush remaining
+    flush_batch(batch_data)
+    pbar.close()
+    prefetch_thread.join(timeout=5)
     
     print(f"\nDone! Success: {success} | Failed: {failed} | Skipped: {skipped}")
     
@@ -383,7 +486,7 @@ def extract_and_cache_embeddings(
         "emotion_backend": emotion_backend,
         "emotion_raw_dim": emotion_enc.raw_dim,
         "prosody_backend": prosody_backend,
-        "prosody_raw_dim": 5,
+        "prosody_raw_dim": prosody_enc.raw_dim,
         "success": success,
         "failed": failed,
     }

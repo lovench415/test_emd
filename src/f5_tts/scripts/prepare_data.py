@@ -325,7 +325,7 @@ def extract_and_cache_embeddings(
     # Prosody (pyworld) is CPU-bound → runs in parallel via ThreadPool.
     # Audio loading is I/O-bound → prefetched in background.
     
-    BATCH_SIZE = 8  # GPU batch for speaker/emotion encoders
+    BATCH_SIZE = 32  # GPU batch for speaker/emotion encoders
     success = 0
     failed = 0
 

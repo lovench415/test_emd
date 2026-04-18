@@ -190,7 +190,7 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
             random.shuffle(batches)
         return batches
 
-    def _can_fit(self, frame_len, batch_frames, batch_size):
+    def _can_fit(self, frame_len, batch_frames, batch_size, batch_max_len=0):
         if frame_len is None or frame_len <= 0:
             return False
         if frame_len > self.frames_threshold:
@@ -198,6 +198,11 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
         if self.max_samples != 0 and batch_size >= self.max_samples:
             return False
         if batch_size > 0 and batch_frames + frame_len > self.frames_threshold:
+            return False
+        # OOM guard: limit padding waste. Real memory usage = max_len × batch_size.
+        # If new sample is much longer than current max, total padded frames explode.
+        new_max = max(batch_max_len, frame_len)
+        if batch_size > 0 and new_max * (batch_size + 1) > self.frames_threshold:
             return False
         return True
 
@@ -211,6 +216,7 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
         prefer_existing_speakers,
     ):
         remaining = []
+        batch_max_len = max((data_source.get_frame_len(i) for i in batch), default=0)
         for idx in candidates:
             frame_len = data_source.get_frame_len(idx)
             speaker = data_source.get_speaker(idx)
@@ -222,7 +228,7 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
                 remaining.append(idx)
                 continue
 
-            if not self._can_fit(frame_len, batch_frames, len(batch)):
+            if not self._can_fit(frame_len, batch_frames, len(batch), batch_max_len):
                 remaining.append(idx)
                 continue
 
@@ -236,6 +242,7 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
 
             batch.append(idx)
             batch_frames += frame_len
+            batch_max_len = max(batch_max_len, frame_len)
             speaker_counter[speaker] += 1
 
         return batch, batch_frames, speaker_counter, remaining

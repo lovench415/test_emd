@@ -325,7 +325,8 @@ def extract_and_cache_embeddings(
     # Prosody (pyworld) is CPU-bound → runs in parallel via ThreadPool.
     # Audio loading is I/O-bound → prefetched in background.
     
-    BATCH_SIZE = 256  # GPU batch for speaker/emotion encoders
+    BATCH_SIZE = 8  # GPU batch for speaker/emotion encoders
+    prosody_on_gpu = prosody_backend in ("rmvpe", "crepe")
     success = 0
     failed = 0
 
@@ -409,12 +410,18 @@ def extract_and_cache_embeddings(
                     emo_frames.append(None)
 
         # 4. Prosody: parallel on CPU (overlaps with next batch's GPU work)
-        with ThreadPoolExecutor(max_workers=min(4, len(batch))) as pool:
-            prosody_futures = [
-                pool.submit(extract_prosody_cpu, audio, sr)
-                for _, audio, sr in batch
+        if prosody_on_gpu:
+            prosody_results = [
+                extract_prosody_cpu(audio, sr) for _, audio, sr in batch
             ]
-            prosody_results = [f.result() for f in prosody_futures]
+        else:
+            n_workers = min(os.cpu_count() or 4, len(batch))
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                prosody_futures = [
+                    pool.submit(extract_prosody_cpu, audio, sr)
+                    for _, audio, sr in batch
+                ]
+                prosody_results = [f.result() for f in prosody_futures]
 
         # 5. Save results
         for j, (idx, _, _) in enumerate(batch):

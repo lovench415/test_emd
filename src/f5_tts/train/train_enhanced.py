@@ -103,6 +103,18 @@ def parse_args():
     g.add_argument("--freeze_base", action="store_true", default=True)
     g.add_argument("--no_freeze_base", dest="freeze_base", action="store_false")
     g.add_argument("--unfreeze_top_k", type=int, default=0)
+    g.add_argument(
+        "--train_stage", type=int, default=0,
+        help="""Isolated curriculum training — only the specified module is trainable,
+all others are frozen. Train each stage until val_loss plateaus, then advance.
+  0 = all conditioning (default, no curriculum)
+  1 = AdaLN + speaker only       (voice identity)
+  2 = prosody direct/global only (pitch/rhythm)
+  3 = cross-attention only       (frame-level emotion/intonation)
+  4 = emo-prosody fusion only    (cross-modal attention)
+  5 = top-K DiT blocks only      (base model fine-tuning)
+        """
+    )
 
     g = p.add_argument_group("conditioning")
     g.add_argument("--speaker_emb_dim", type=int, default=512)
@@ -233,6 +245,147 @@ def load_pretrained_weights(model: EnhancedCFM, ckpt_path: str):
 # ══════════════════════════════════════════════════════════════════════
 #  Freeze strategy
 # ══════════════════════════════════════════════════════════════════════
+
+def apply_curriculum_stage(model: EnhancedCFM, stage: int, unfreeze_top_k: int = 0):
+    """Curriculum training: only the specified module is trainable,
+    all others are frozen. Gates of inactive modules are zeroed so
+    they produce no output in forward() — prevents random noise injection
+    from untrained frozen modules when starting from base F5-TTS.
+
+    IMPORTANT: AdaLN is always kept active (stages 2-4) because it is
+    the base conditioning pathway. Without it, frozen random Kaiming init
+    injects uncontrolled scale/shift into every DiT block.
+
+    Stage 1: AdaLN + speaker        — voice identity (start here)
+    Stage 2: prosody direct/global  — pitch/rhythm (needs stage 1 done first)
+    Stage 3: cross-attention        — frame-level emotion/intonation
+    Stage 4: emo-prosody fusion     — cross-modal attention
+    Stage 5: top-K DiT blocks       — base model fine-tuning
+    """
+    if stage == 0:
+        return  # no curriculum
+
+    agg = model.transformer.cond_aggregator
+
+    def unfreeze(mod):
+        if mod is None:
+            return
+        if isinstance(mod, torch.nn.Parameter):
+            mod.requires_grad = True
+        else:
+            for p in mod.parameters():
+                p.requires_grad = True
+
+    def zero_gates_in(mod, value=0.0):
+        """Set all gate parameters in a module/dict to value."""
+        if mod is None:
+            return
+        items = list(mod.values()) if hasattr(mod, 'values') else [mod]
+        for m in items:
+            if hasattr(m, 'gate') and isinstance(m.gate, torch.nn.Parameter):
+                with torch.no_grad():
+                    m.gate.fill_(value)
+
+    def zero_param(name, value=0.0):
+        p = getattr(agg, name, None)
+        if p is not None and isinstance(p, torch.nn.Parameter):
+            with torch.no_grad():
+                p.fill_(value)
+
+    # 1. Freeze all parameters
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # 2. Zero gates ONLY for modules not yet trained at this stage.
+    #    Trained modules keep their learned values.
+    #
+    #    stage 1 → zero all gated modules (nothing trained yet)
+    #    stage 2 → zero cross_attns, prosody_cross_attns, emo_fusion
+    #              keep prosody_block/global_gates (being trained now)
+    #    stage 3 → zero emo_fusion only
+    #              keep prosody gates (trained stage 2) + cross_attns (being trained)
+    #    stage 4 → zero nothing
+    #              keep all (emo_fusion being trained, rest already trained)
+
+    if stage < 2:
+        zero_param("prosody_block_gates", 0.0)
+        zero_param("prosody_global_gate", 0.0)
+    if stage < 3:
+        zero_gates_in(getattr(agg, "cross_attns", None), 0.0)
+        zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.0)
+    if stage < 4:
+        zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.0)
+
+    # 3. AdaLN is always active for stages 2-4: 
+    #    Without it, frozen random Kaiming weights inject uncontrolled
+    #    scale/shift into every DiT block → garbled output.
+    #    For stage 1: AdaLN is the primary target anyway.
+    #    For stage 5: DiT blocks are the target, AdaLN should be frozen
+    #                 to isolate DiT block learning.
+    if stage in (1, 2, 3, 4):
+        unfreeze(getattr(agg, "adaln_cond", None))
+        unfreeze(getattr(agg, "fusion", None))
+        unfreeze(getattr(agg, "speaker_raw_proj", None))
+        unfreeze(getattr(agg, "emotion_raw_proj", None))
+        unfreeze(getattr(agg, "input_add", None))
+
+    # 4. Unfreeze active stage + restore its gates to init values
+
+    if stage == 1:
+        pass  # AdaLN+speaker already unfrozen above
+
+    elif stage == 2:
+        unfreeze(getattr(agg, "prosody_direct_proj", None))
+        unfreeze(getattr(agg, "prosody_temporal_smooth", None))
+        unfreeze(getattr(agg, "prosody_global_proj", None))
+        # Restore gates to init (were zeroed above)
+        for attr, init_val in (("prosody_block_gates", 0.02), ("prosody_global_gate", 0.15)):
+            p = getattr(agg, attr, None)
+            if p is not None and isinstance(p, torch.nn.Parameter):
+                with torch.no_grad():
+                    p.fill_(init_val)
+                p.requires_grad = True
+
+    elif stage == 3:
+        unfreeze(getattr(agg, "cross_attns", None))
+        unfreeze(getattr(agg, "prosody_cross_attns", None))
+        unfreeze(getattr(agg, "frame_raw_proj", None))
+        unfreeze(getattr(agg, "prosody_raw_proj", None))
+        # Restore gates to init
+        zero_gates_in(getattr(agg, "cross_attns", None), 0.15)
+        zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.15)
+
+    elif stage == 4:
+        unfreeze(getattr(agg, "emo_prosody_fusion", None))
+        zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.15)
+
+    elif stage == 5 and unfreeze_top_k > 0:
+        blocks = model.transformer.transformer_blocks
+        for i in range(max(0, len(blocks) - unfreeze_top_k), len(blocks)):
+            for p in blocks[i].parameters():
+                p.requires_grad = True
+        for p in model.transformer.norm_out.parameters():
+            p.requires_grad = True
+        for p in model.transformer.proj_out.parameters():
+            p.requires_grad = True
+
+    # Duration predictor always trainable if present
+    if model.duration_predictor is not None:
+        for p in model.duration_predictor.parameters():
+            p.requires_grad = True
+
+    stage_names = {
+        1: "AdaLN + speaker only",
+        2: "AdaLN (active) + prosody direct/global (new)",
+        3: "AdaLN (active) + cross-attention (new)",
+        4: "AdaLN (active) + emo-prosody fusion (new)",
+        5: f"Top-{unfreeze_top_k} DiT blocks only",
+    }
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Stage {stage}: {stage_names.get(stage, 'unknown')}")
+    print(f"  Total: {total:,} | Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
+
 
 def apply_freeze(model: EnhancedCFM, freeze_base: bool, unfreeze_top_k: int):
     """Freeze base model weights; keep conditioning + duration predictor trainable."""
@@ -800,10 +953,14 @@ def main():
     ckpt_path = download_pretrained(args)
     load_pretrained_weights(model, ckpt_path)
 
-    # 4. Freeze
+    # 4. Freeze / curriculum stage
     if is_main:
-        print(f"Freeze: base={args.freeze_base}, unfreeze_top_k={args.unfreeze_top_k}")
-    apply_freeze(model, args.freeze_base, args.unfreeze_top_k)
+        print(f"Freeze: base={args.freeze_base}, unfreeze_top_k={args.unfreeze_top_k}, "
+              f"train_stage={args.train_stage}")
+    if args.train_stage > 0:
+        apply_curriculum_stage(model, args.train_stage, args.unfreeze_top_k)
+    else:
+        apply_freeze(model, args.freeze_base, args.unfreeze_top_k)
 
     # 5. EMA (main process)
     ema = EMA(model, include_online_model=False) if is_main else None

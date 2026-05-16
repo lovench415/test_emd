@@ -307,14 +307,14 @@ def apply_curriculum_stage(model: EnhancedCFM, stage: int, unfreeze_top_k: int =
     #    stage 4 → zero nothing
     #              keep all (emo_fusion being trained, rest already trained)
 
-    if stage < 2:
-        zero_param("prosody_block_gates", 0.0)
-        zero_param("prosody_global_gate", 0.0)
-    if stage < 3:
-        zero_gates_in(getattr(agg, "cross_attns", None), 0.0)
-        zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.0)
-    if stage < 4:
-        zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.0)
+    #if stage < 2:
+    #    zero_param("prosody_block_gates", 0.0)
+    #    zero_param("prosody_global_gate", 0.0)
+    #if stage < 3:
+    #    zero_gates_in(getattr(agg, "cross_attns", None), 0.0)
+    #    zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.0)
+    #if stage < 4:
+    #    zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.0)
 
     # 3. AdaLN is always active for stages 2-4: 
     #    Without it, frozen random Kaiming weights inject uncontrolled

@@ -351,6 +351,8 @@ def apply_curriculum_stage(model, stage: int,
     if adaln_active:
         unfreeze(getattr(agg, "adaln_cond", None))
         unfreeze(getattr(agg, "input_add", None))
+        unfreeze(getattr(agg, "emotion_raw_proj", None))
+        unfreeze(getattr(agg, "fusion", None))
 
     # ── Stage-specific modules ─────────────────────────────────────────
 
@@ -367,9 +369,24 @@ def apply_curriculum_stage(model, stage: int,
         unfreeze(getattr(agg, "prosody_cross_attns", None))
         # Restore prosody gates (were zeroed at stage < 2)
         if stage == 2:
-            restore_gate("prosody_block_gates", 0.02)
-            restore_gate("prosody_global_gate", 0.02)
-            zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.15)
+            pg = getattr(agg, "prosody_block_gates", None)
+            if pg is not None and pg.detach().abs().max().item() < 1e-6:
+                restore_gate("prosody_block_gates", 0.02)
+                restore_gate("prosody_global_gate", 0.02)
+            else:
+                for attr in ("prosody_block_gates", "prosody_global_gate"):
+                    p = getattr(agg, attr, None)
+                    if p is not None and isinstance(p, torch.nn.Parameter):
+                        p.requires_grad = True
+            pca = getattr(agg, "prosody_cross_attns", None)
+            if pca is not None:
+                all_zero = all(
+                    abs(m.gate.detach().item()) < 1e-6
+                    for m in (pca.values() if hasattr(pca, "values") else [pca])
+                    if hasattr(m, "gate")
+                )
+                if all_zero:
+                    zero_gates_in(pca, 0.15)
         else:
             # Stage 3+: prosody already trained, just unfreeze gates as-is
             for attr in ("prosody_block_gates", "prosody_global_gate"):
@@ -379,7 +396,6 @@ def apply_curriculum_stage(model, stage: int,
         if model.duration_predictor is not None:
             for p in model.duration_predictor.parameters():
                 p.requires_grad = True
-
     if stage >= 3:
         # Emotion — global (→ adaln via fusion) + frame-level (→ cross_attns)
         unfreeze(getattr(agg, "emotion_raw_proj", None))
@@ -387,13 +403,30 @@ def apply_curriculum_stage(model, stage: int,
         unfreeze(getattr(agg, "cross_attns", None))
         # Restore cross_attn gates (were zeroed at stage < 3)
         if stage == 3:
-            zero_gates_in(getattr(agg, "cross_attns", None), 0.15)
+            ca = getattr(agg, "cross_attns", None)
+            if ca is not None:
+                all_zero = all(
+                    abs(m.gate.detach().item()) < 1e-6
+                    for m in (ca.values() if hasattr(ca, "values") else [ca])
+                    if hasattr(m, "gate")
+                )
+                if all_zero:
+                    zero_gates_in(ca, 0.15)
 
     if stage >= 4:
         # Emo-prosody fusion — cross-modal attention between emotion and prosody
         unfreeze(getattr(agg, "emo_prosody_fusion", None))
         if stage == 4:
-            zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.15)
+            if stage == 4:
+            ef = getattr(agg, "emo_prosody_fusion", None)
+            if ef is not None:
+                all_zero = all(
+                    abs(m.gate.detach().item()) < 1e-6
+                    for m in (ef.values() if hasattr(ef, "values") else [ef])
+                    if hasattr(m, "gate")
+                )
+                if all_zero:
+                    zero_gates_in(ef, 0.15)
 
     if stage >= 5 and unfreeze_top_k > 0:
         # DiT blocks — base model fine-tuning

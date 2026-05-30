@@ -41,6 +41,7 @@ class EnhancedDataset(Dataset):
         embedding_index_map: list[int] | None = None,
         speaker_raw_dim: int = 512,
         emotion_raw_dim: int = 768,
+        speed_perturb: bool = False,
     ):
         super().__init__()
         self.data = hf_dataset
@@ -52,6 +53,8 @@ class EnhancedDataset(Dataset):
         self.embedding_index_map = embedding_index_map
         self.speaker_raw_dim = speaker_raw_dim
         self.emotion_raw_dim = emotion_raw_dim
+        self.speed_perturb = speed_perturb
+        self.training = True  # set to False for val dataset
 
         if not preprocessed_mel:
             self.mel_spectrogram = default(
@@ -119,6 +122,21 @@ class EnhancedDataset(Dataset):
                 audio = audio.mean(dim=0, keepdim=True)
             if sr != self.target_sample_rate:
                 audio = torchaudio.transforms.Resample(sr, self.target_sample_rate)(audio)
+            # Speed perturbation: random 0.9-1.1× speed during training
+            # Improves generalisation to different speaking rates.
+            # Disabled during eval (speed_perturb=False in val dataset).
+            if self.speed_perturb and self.training:
+                speed = 0.9 + torch.rand(1).item() * 0.2  # [0.9, 1.1]
+                effects = [["speed", str(speed)], ["rate", str(self.target_sample_rate)]]
+                audio_np = audio.squeeze(0).numpy()
+                import sox
+                try:
+                    import torchaudio.sox_effects as sox_fx
+                    audio, _ = sox_fx.apply_effects_tensor(
+                        audio, self.target_sample_rate, effects, channels_first=True
+                    )
+                except Exception:
+                    pass  # skip perturbation if sox unavailable
             mel_spec = self.mel_spectrogram(audio).squeeze(0)
 
         result = {"mel_spec": mel_spec, "text": row["text"]}

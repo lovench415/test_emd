@@ -351,14 +351,26 @@ def apply_curriculum_stage(model, stage: int,
     if adaln_active:
         unfreeze(getattr(agg, "adaln_cond", None))
         unfreeze(getattr(agg, "input_add", None))
-        unfreeze(getattr(agg, "emotion_raw_proj", None))
+
+    # ── fusion: always active on stages 1-5 ───────────────────────────
+    # fusion(speaker_emb, emotion_emb) → fused_global → adaln_cond / input_add
+    # Without fusion being trained, adaln_cond receives random noise on ALL stages.
+    if stage in (1, 2, 3, 4, 5):
         unfreeze(getattr(agg, "fusion", None))
+        # emotion_raw_proj feeds fusion. If frozen with Kaiming init,
+        # emotion_emb is random → fused_global partially noisy.
+        # Unfreeze from stage 1 so fusion gets clean inputs from both sides.
+        unfreeze(getattr(agg, "emotion_raw_proj", None))
 
     # ── Stage-specific modules ─────────────────────────────────────────
 
     if stage >= 1:
         # Speaker global identity
         unfreeze(getattr(agg, "speaker_raw_proj", None))
+        # Duration predictor is fundamental — train from stage 1
+        if model.duration_predictor is not None:
+            for p in model.duration_predictor.parameters():
+                p.requires_grad = True
 
     if stage >= 2:
         # Prosody — all three paths
@@ -367,7 +379,8 @@ def apply_curriculum_stage(model, stage: int,
         unfreeze(getattr(agg, "prosody_temporal_smooth", None))
         unfreeze(getattr(agg, "prosody_raw_proj", None))
         unfreeze(getattr(agg, "prosody_cross_attns", None))
-        # Restore prosody gates (were zeroed at stage < 2)
+        # Restore prosody gates only if currently zero (first run of stage 2).
+        # If non-zero → resuming stage 2, keep learned values.
         if stage == 2:
             pg = getattr(agg, "prosody_block_gates", None)
             if pg is not None and pg.detach().abs().max().item() < 1e-6:
@@ -393,15 +406,13 @@ def apply_curriculum_stage(model, stage: int,
                 p = getattr(agg, attr, None)
                 if p is not None and isinstance(p, torch.nn.Parameter):
                     p.requires_grad = True
-        if model.duration_predictor is not None:
-            for p in model.duration_predictor.parameters():
-                p.requires_grad = True
+        # duration_predictor already unfrozen in stage >= 1 block
+
     if stage >= 3:
-        # Emotion — global (→ adaln via fusion) + frame-level (→ cross_attns)
-        unfreeze(getattr(agg, "emotion_raw_proj", None))
+        # Emotion frame-level — cross_attns (global emotion_raw_proj already active above)
         unfreeze(getattr(agg, "frame_raw_proj", None))
         unfreeze(getattr(agg, "cross_attns", None))
-        # Restore cross_attn gates (were zeroed at stage < 3)
+        # Restore cross_attn gates only if currently zero (first run of stage 3).
         if stage == 3:
             ca = getattr(agg, "cross_attns", None)
             if ca is not None:
@@ -417,8 +428,7 @@ def apply_curriculum_stage(model, stage: int,
         # Emo-prosody fusion — cross-modal attention between emotion and prosody
         unfreeze(getattr(agg, "emo_prosody_fusion", None))
         if stage == 4:
-            if stage == 4:
-                ef = getattr(agg, "emo_prosody_fusion", None)
+            ef = getattr(agg, "emo_prosody_fusion", None)
             if ef is not None:
                 all_zero = all(
                     abs(m.gate.detach().item()) < 1e-6
@@ -428,20 +438,23 @@ def apply_curriculum_stage(model, stage: int,
                 if all_zero:
                     zero_gates_in(ef, 0.15)
 
-    if stage >= 5 and unfreeze_top_k > 0:
-        # DiT blocks — base model fine-tuning
-        blocks = model.transformer.transformer_blocks
-        for i in range(max(0, len(blocks) - unfreeze_top_k), len(blocks)):
-            for p in blocks[i].parameters():
+    if stage >= 5:
+        if unfreeze_top_k <= 0:
+            print(f"  ⚠ Stage 5 requires --unfreeze_top_k > 0 to unfreeze DiT blocks. "
+                  f"Currently no DiT blocks will be unfrozen.")
+        else:
+            # DiT blocks — base model fine-tuning
+            blocks = model.transformer.transformer_blocks
+            for i in range(max(0, len(blocks) - unfreeze_top_k), len(blocks)):
+                for p in blocks[i].parameters():
+                    p.requires_grad = True
+            for p in model.transformer.norm_out.parameters():
                 p.requires_grad = True
-        for p in model.transformer.norm_out.parameters():
-            p.requires_grad = True
-        for p in model.transformer.proj_out.parameters():
-            p.requires_grad = True
+            for p in model.transformer.proj_out.parameters():
+                p.requires_grad = True
 
     if stage >= 6:
         # All conditioning — joint fine-tuning (use low LR via build_param_groups)
-        unfreeze(getattr(agg, "fusion", None))
         for name in (
             "speaker_raw_proj", "emotion_raw_proj", "frame_raw_proj",
             "fusion", "adaln_cond", "input_add",
@@ -1224,21 +1237,22 @@ def main():
     # immediately without warmup. With 3-5× warmup, gate stabilises before decaying.
     cross_attn_warmup = args.num_warmup_updates_cross_attn * accelerator.num_processes
     if cross_attn_warmup > warmup:
-        cross_attn_group_idx = next(
-            (i for i, g in enumerate(param_groups) if g.get("name") in ("cross_attn", "prosody_cross_attn", "emotion", "input_proj")),
-            None,
-        )
-        if cross_attn_group_idx is not None and is_main:
+        if is_main:
             print(f"  Cross-attn extended warmup: {cross_attn_warmup} steps "
                   f"(global warmup: {warmup} steps)")
             print(f"  → cross-attn LR will reach peak at step {cross_attn_warmup} "
                   f"(other groups peak at step {warmup})")
 
-        # Zero out cross-attn group LRs and ramp up via per-step scaling in training loop.
+        # Capture target LRs from scheduler base_lrs (NOT g["lr"] — the LinearLR
+        # warmup scheduler already scaled g["lr"] down by start_factor=1e-8 at
+        # creation, so g["lr"] no longer holds the true target). base_lrs holds
+        # the correct pre-warmup target LR for each group.
+        # Then zero the group LR so the global scheduler contributes nothing;
+        # per-step override in the training loop drives these groups.
         _cross_attn_init_lrs = {}
         for i, g in enumerate(param_groups):
             if g.get("name") in ("cross_attn", "prosody_cross_attn", "emotion", "input_proj"):
-                _cross_attn_init_lrs[i] = g["lr"]
+                _cross_attn_init_lrs[i] = warmup_sched.base_lrs[i]
                 g["lr"] = 0.0  # start at 0, ramp up separately
     else:
         _cross_attn_init_lrs = {}
@@ -1307,6 +1321,13 @@ def main():
         if is_main:
             print(f"Resumed at step {step}, epoch {start_epoch}")
         del ckpt
+
+    # Pre-compute cross-attn decay_steps once (used in training loop per-step)
+    if _cross_attn_init_lrs:
+        _total_steps = math.ceil(len(dataloader) / args.grad_accumulation_steps) * args.epochs
+        _cross_attn_decay_steps = max(_total_steps - cross_attn_warmup, 1)
+    else:
+        _cross_attn_decay_steps = 0
 
     # ── Training loop ─────────────────────────────────────────────
     if is_main:
@@ -1403,10 +1424,23 @@ def main():
                     optimizer.zero_grad()
 
                     # Per-group extended warmup for cross-attn groups.
-                    if _cross_attn_init_lrs and step < cross_attn_warmup:
-                        scale = min(1.0, step / max(cross_attn_warmup, 1))
+                    # Phase 1 (step < cross_attn_warmup): linear ramp 0 → target_lr
+                    # Phase 2 (step >= cross_attn_warmup): cosine decay target_lr → target_lr * 0.01
+                    # This gives cross-attn groups their own independent warmup+cosine schedule.
+                    # decay_steps pre-computed before loop (see _cross_attn_decay_steps).
+                    if _cross_attn_init_lrs:
                         for i, target_lr in _cross_attn_init_lrs.items():
-                            optimizer.param_groups[i]["lr"] = target_lr * scale
+                            if step < cross_attn_warmup:
+                                # Linear warmup
+                                scale = step / max(cross_attn_warmup, 1)
+                                optimizer.param_groups[i]["lr"] = target_lr * scale
+                            else:
+                                # Cosine decay from target_lr to target_lr * 0.01
+                                t = (step - cross_attn_warmup) / _cross_attn_decay_steps
+                                t = min(t, 1.0)
+                                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t))
+                                min_lr = target_lr * 1e-2
+                                optimizer.param_groups[i]["lr"] = min_lr + (target_lr - min_lr) * cosine_factor
 
             if accelerator.sync_gradients:
                 if is_main and ema:

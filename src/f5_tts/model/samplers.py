@@ -18,6 +18,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
         max_samples: int = 0,
         random_seed: int | None = None,
         drop_residual: bool = False,
+        rebuild_every_n_steps: int = 0,
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
@@ -26,6 +27,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
         self.drop_residual = drop_residual
         self.epoch = 0
         self.drop_last = True
+        self.rebuild_every_n_steps = rebuild_every_n_steps
         self.batches = self._build_batches()
 
     def _build_batches(self) -> list[list[int]]:
@@ -74,8 +76,22 @@ class DynamicBatchSampler(Sampler[list[int]]):
             g = torch.Generator()
             g.manual_seed(self.random_seed + self.epoch)
             order = torch.randperm(len(self.batches), generator=g).tolist()
-            return iter([self.batches[i] for i in order])
-        return iter(self.batches)
+            batches = [self.batches[i] for i in order]
+        else:
+            batches = list(self.batches)
+
+        if self.rebuild_every_n_steps <= 0:
+            return iter(batches)
+
+        def _iter_with_reshuffle():
+            remaining = list(batches)
+            step = 0
+            while remaining:
+                yield remaining.pop(0)
+                step += 1
+                if step % self.rebuild_every_n_steps == 0 and remaining:
+                    random.shuffle(remaining)
+        return _iter_with_reshuffle()
 
     def __len__(self):
         return len(self.batches)
@@ -90,6 +106,7 @@ class BucketDynamicBatchSampler(Sampler[list[int]]):
         bucket_size: int = 512,
         random_seed: int | None = 42,
         drop_residual: bool = False,
+        rebuild_every_n_steps: int = 0,
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
@@ -99,6 +116,7 @@ class BucketDynamicBatchSampler(Sampler[list[int]]):
         self.drop_residual = drop_residual
         self.epoch = 0
         self.drop_last = True
+        self.rebuild_every_n_steps = rebuild_every_n_steps
         self.batches: list[list[int]] = []
         self._rebuild_batches()
 
@@ -138,7 +156,18 @@ class BucketDynamicBatchSampler(Sampler[list[int]]):
         self.batches = batches
 
     def __iter__(self):
-        return iter(self.batches)
+        if self.rebuild_every_n_steps <= 0:
+            return iter(self.batches)
+
+        def _iter_with_reshuffle():
+            remaining = list(self.batches)
+            step = 0
+            while remaining:
+                yield remaining.pop(0)
+                step += 1
+                if step % self.rebuild_every_n_steps == 0 and remaining:
+                    random.shuffle(remaining)
+        return _iter_with_reshuffle()
 
     def __len__(self):
         return len(self.batches)
@@ -156,6 +185,7 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
         max_samples_per_speaker: int = 8,
         random_seed=None,
         drop_residual: bool = False,
+        rebuild_every_n_steps: int = 0,
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
@@ -168,6 +198,7 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
         self.drop_residual = drop_residual
         self.drop_last = True
         self.batches = []
+        self.rebuild_every_n_steps = rebuild_every_n_steps  # 0 = only at epoch start
         self._rebuild_batches()
 
     def set_epoch(self, epoch: int) -> None:
@@ -209,17 +240,18 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
     def _try_fill_batch_from_candidates(
         self,
         candidates,
-        data_source,
+        get_fl,
+        get_sp,
         batch,
         batch_frames,
+        batch_max_len,
         speaker_counter,
         prefer_existing_speakers,
     ):
         remaining = []
-        batch_max_len = max((data_source.get_frame_len(i) for i in batch), default=0)
         for idx in candidates:
-            frame_len = data_source.get_frame_len(idx)
-            speaker = data_source.get_speaker(idx)
+            frame_len = get_fl(idx)
+            speaker = get_sp(idx)
 
             if frame_len is None or frame_len <= 0:
                 continue
@@ -245,53 +277,67 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
             batch_max_len = max(batch_max_len, frame_len)
             speaker_counter[speaker] += 1
 
-        return batch, batch_frames, speaker_counter, remaining
+        return batch, batch_frames, batch_max_len, speaker_counter, remaining
 
     def _rebuild_batches(self):
         data_source = self.sampler.data_source
         indices = list(self.sampler)
         indices = self._shuffle_indices(indices)
 
+        # Cache frame_len and speaker for all indices once — avoids O(N²) lookups.
+        # get_frame_len/get_speaker may touch HF dataset rows which are slow.
+        frame_len_cache = {}
+        speaker_cache = {}
+        for idx in indices:
+            fl = data_source.get_frame_len(idx)
+            frame_len_cache[idx] = fl
+            if fl and fl > 0:
+                speaker_cache[idx] = data_source.get_speaker(idx)
+
+        def get_fl(idx):
+            return frame_len_cache.get(idx)
+
+        def get_sp(idx):
+            return speaker_cache.get(idx, "default")
+
         buckets = [indices[i : i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)]
         batches = []
 
         for bucket in buckets:
-            bucket = sorted(bucket, key=lambda idx: data_source.get_frame_len(idx))
+            bucket = sorted(bucket, key=lambda idx: frame_len_cache.get(idx) or 0)
             pending = bucket[:]
 
             while pending:
                 batch = []
                 batch_frames = 0
+                batch_max_len = 0
                 speaker_counter = Counter()
 
                 seed_idx = pending.pop(0)
-                seed_frame_len = data_source.get_frame_len(seed_idx)
-                seed_speaker = data_source.get_speaker(seed_idx)
+                seed_frame_len = get_fl(seed_idx)
+                seed_speaker = get_sp(seed_idx)
 
                 if seed_frame_len is None or seed_frame_len <= 0 or seed_frame_len > self.frames_threshold:
                     continue
 
                 batch.append(seed_idx)
                 batch_frames = seed_frame_len
+                batch_max_len = seed_frame_len
                 speaker_counter[seed_speaker] = 1
 
-                batch, batch_frames, speaker_counter, pending = self._try_fill_batch_from_candidates(
-                    pending,
-                    data_source,
-                    batch,
-                    batch_frames,
-                    speaker_counter,
-                    prefer_existing_speakers=True,
-                )
+                batch, batch_frames, batch_max_len, speaker_counter, pending = \
+                    self._try_fill_batch_from_candidates(
+                        pending, get_fl, get_sp,
+                        batch, batch_frames, batch_max_len,
+                        speaker_counter, prefer_existing_speakers=True,
+                    )
 
-                batch, batch_frames, speaker_counter, pending = self._try_fill_batch_from_candidates(
-                    pending,
-                    data_source,
-                    batch,
-                    batch_frames,
-                    speaker_counter,
-                    prefer_existing_speakers=False,
-                )
+                batch, batch_frames, batch_max_len, speaker_counter, pending = \
+                    self._try_fill_batch_from_candidates(
+                        pending, get_fl, get_sp,
+                        batch, batch_frames, batch_max_len,
+                        speaker_counter, prefer_existing_speakers=False,
+                    )
 
                 if batch:
                     batches.append(batch)
@@ -309,8 +355,21 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
         self.batches = self._shuffle_batches(batches)
 
     def __iter__(self):
-        for batch in self.batches:
-            yield batch
+        if self.rebuild_every_n_steps <= 0:
+            # Standard: yield all pre-built batches
+            for batch in self.batches:
+                yield batch
+        else:
+            # Mid-epoch rebuild: re-shuffle batches every N steps
+            # Keeps diversity high without O(N²) full rebuild each time
+            step = 0
+            batches = list(self.batches)  # copy so we can reshuffle
+            while batches:
+                yield batches.pop(0)
+                step += 1
+                if step % self.rebuild_every_n_steps == 0 and batches:
+                    # Reshuffle remaining batches — fast, no dataset access
+                    self._shuffle_batches(batches)
 
     def __len__(self):
         return len(self.batches)

@@ -418,7 +418,7 @@ def apply_curriculum_stage(model, stage: int,
         unfreeze(getattr(agg, "emo_prosody_fusion", None))
         if stage == 4:
             if stage == 4:
-            ef = getattr(agg, "emo_prosody_fusion", None)
+                ef = getattr(agg, "emo_prosody_fusion", None)
             if ef is not None:
                 all_zero = all(
                     abs(m.gate.detach().item()) < 1e-6

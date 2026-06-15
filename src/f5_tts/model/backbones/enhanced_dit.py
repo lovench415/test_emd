@@ -88,10 +88,15 @@ class EnhancedDiT(nn.Module):
         prosody_dim: int = 256,
         prosody_raw_dim: int | None = None,
         use_prosody_cross_attn: bool = True,
+        use_prosody_direct: bool = True,
+        fusion_mode: str = "concat",
+        cross_attn_gate_floor: float = 0.0,
         prosody_cross_attn_layers: list[int] | None = None,
         prosody_cross_attn_heads: int = 8,
         prosody_cross_attn_dim_head: int = 64,
         prosody_direct_layers: list[int] | None = None,
+        speaker_emb_dropout: float = 0.0,
+        speaker_emb_noise: float = 0.0,
     ):
         super().__init__()
         self.dim = dim
@@ -118,10 +123,15 @@ class EnhancedDiT(nn.Module):
             speaker_raw_dim=speaker_raw_dim, emotion_raw_dim=emotion_raw_dim, adaln_bottleneck_dim=adaln_bottleneck_dim,
             prosody_dim=prosody_dim, prosody_raw_dim=prosody_raw_dim,
             use_prosody_cross_attn=use_prosody_cross_attn,
+            use_prosody_direct=use_prosody_direct,
+            fusion_mode=fusion_mode,
+            cross_attn_gate_floor=cross_attn_gate_floor,
             prosody_cross_attn_layers=prosody_cross_attn_layers,
             prosody_cross_attn_heads=prosody_cross_attn_heads,
             prosody_cross_attn_dim_head=prosody_cross_attn_dim_head,
             prosody_direct_layers=prosody_direct_layers,
+            speaker_emb_dropout=speaker_emb_dropout,
+            speaker_emb_noise=speaker_emb_noise,
         )
         self._init_weights()
 

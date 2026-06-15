@@ -162,7 +162,7 @@ python -m f5_tts.scripts.prepare_data \
     
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     _run_cmd(f"""
-python train_enhanced.py \
+python -m f5_tts.train.train_enhanced \
     --dataset_dir "{dataset_dir}" \
     --embedding_dir "{embedding_dir}" \
     --checkpoint_dir "{ckpt_dir}" \
@@ -268,7 +268,7 @@ python -m f5_tts.scripts.prepare_data \
     
     print(f"\n[2/3] Stage 1: conditioning modules ({epochs_s1} эпох)...")
     _run_cmd(f"""
-python train_enhanced.py \
+python -m f5_tts.train.train_enhanced \
     --dataset_dir "{dataset_dir}" \
     --embedding_dir "{embedding_dir}" \
     --checkpoint_dir "{ckpt_dir}" \
@@ -285,7 +285,7 @@ python train_enhanced.py \
     if total_hours >= 2:
         print(f"\n[3/3] Stage 2: + top-4 DiT blocks (2 эпохи)...")
         _run_cmd(f"""
-python train_enhanced.py \
+python -m f5_tts.train.train_enhanced \
     --dataset_dir "{dataset_dir}" \
     --embedding_dir "{embedding_dir}" \
     --pretrain_ckpt "{ckpt_dir}/model_last.pt" \
@@ -368,7 +368,7 @@ def multi_speaker_finetune(args):
     
     print(f"\n[1/2] Stage 1: conditioning ({epochs} эпох)...")
     _run_cmd(f"""
-python train_enhanced.py \
+python -m f5_tts.train.train_enhanced \
     --dataset_dir "{dataset_dir}" \
     --embedding_dir "{embedding_dir}" \
     --checkpoint_dir "{ckpt_dir}" \
@@ -385,7 +385,7 @@ python train_enhanced.py \
     # ── Stage 2 ──
     print(f"\n[2/2] Stage 2: + top-4 blocks (2 эпохи)...")
     _run_cmd(f"""
-python train_enhanced.py \
+python -m f5_tts.train.train_enhanced \
     --dataset_dir "{dataset_dir}" \
     --embedding_dir "{embedding_dir}" \
     --pretrain_ckpt "{ckpt_dir}/model_last.pt" \
@@ -545,7 +545,7 @@ def _auto_batch_size() -> int:
     if not torch.cuda.is_available():
         return 3200
     
-    mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if mem_gb >= 40:
         return 38400
     elif mem_gb >= 24:

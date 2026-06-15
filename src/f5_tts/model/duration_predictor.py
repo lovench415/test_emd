@@ -2,7 +2,11 @@
 Duration Predictor — predicts mel frame count for target text given prosody.
 
 Architecture:
-    prosody_global (5) + speaker_emb (512) + text_byte_len (1)
+    prosody_global (7: per-channel masked mean of raw prosody) + speaker_emb (512) + text_len (1)
+    NOTE: text length unit is CHARACTERS (Unicode codepoints), not bytes.
+    Byte units biased duration across scripts (Cyrillic=2 bytes/char →
+    a model trained on Cyrillic halves the duration of Latin text).
+    Models trained before this change used bytes — retrain to use chars.
     → MLP → speaking_rate (frames/byte)
     → gen_duration = text_byte_len × speaking_rate
 
@@ -45,14 +49,34 @@ class DurationPredictor(nn.Module):
         speaker_dim: int = 512,
         hidden_dim: int = 256,
         use_speaker: bool = True,
+        speaker_dropout: float = 0.0,    # dropout on the raw speaker vector before
+                                         # it enters the predictor. The speaker
+                                         # embedding is ~98% of the input width, so
+                                         # the predictor easily memorises per-speaker
+                                         # rates instead of learning rate-from-prosody
+                                         # → it extrapolates badly to unseen (e.g.
+                                         # cross-language) speakers and over-predicts
+                                         # duration. 0.2-0.5 recommended when
+                                         # use_speaker=True.
+        speaker_bottleneck: int = 0,     # if >0, compress speaker_dim → this width
+                                         # before concatenation, shrinking the
+                                         # speaker share of the input and limiting
+                                         # memorisation capacity (e.g. 32).
+        input_dropout: float = 0.0,      # dropout on the full input vector.
     ):
         super().__init__()
         self.use_speaker = use_speaker
         self.speaker_dim = speaker_dim
+        self.speaker_dropout = nn.Dropout(speaker_dropout) if speaker_dropout > 0 else None
+        self.speaker_proj = (
+            nn.Linear(speaker_dim, speaker_bottleneck)
+            if (use_speaker and speaker_bottleneck > 0) else None
+        )
+        self.input_dropout = nn.Dropout(input_dropout) if input_dropout > 0 else None
 
         input_dim = prosody_global_dim + 1  # +1 for log(text_byte_len)
         if use_speaker:
-            input_dim += speaker_dim
+            input_dim += speaker_bottleneck if speaker_bottleneck > 0 else speaker_dim
 
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -134,22 +158,45 @@ class DurationPredictor(nn.Module):
         # Build input
         parts = [prosody_global, log_text_len]
         if self.use_speaker and speaker_emb is not None:
-            parts.append(speaker_emb.to(dtype=dtype))
+            spk = speaker_emb.to(dtype=dtype)
+            if self.speaker_dropout is not None:
+                spk = self.speaker_dropout(spk)
+            if self.speaker_proj is not None:
+                spk = self.speaker_proj(spk.to(next(self.speaker_proj.parameters()).dtype)).to(dtype)
+            parts.append(spk)
         elif self.use_speaker:
-            parts.append(torch.zeros(B, self.speaker_dim, device=device, dtype=dtype))
+            width = self.speaker_proj.out_features if self.speaker_proj is not None else self.speaker_dim
+            parts.append(torch.zeros(B, width, device=device, dtype=dtype))
 
         x = torch.cat(parts, dim=-1)  # (B, input_dim)
+        if self.input_dropout is not None:
+            x = self.input_dropout(x)
+
+        # AMP guard: prosody_global/speaker_emb may arrive as fp16 (from cached
+        # half-precision embeddings or autocast), but this head's Linear weights
+        # are fp32. F.linear requires matching dtypes. Run the whole head in the
+        # net's weight dtype and keep the result in that dtype (compute_loss takes
+        # log + L1 vs an fp32 target; predict_duration only calls .item()).
+        # (autocast does not cast module weights, only ops, so this needs an
+        # explicit cast.)
+        net_dtype = next(self.net.parameters()).dtype
+        x = x.to(net_dtype)
+        text_len_net = text_len_f.to(net_dtype)
 
         # Predict rate adjustment (multiplicative correction on base rate)
         adjustment = self.net(x).squeeze(-1)  # (B,) positive via Softplus
 
         # Final rate = base_rate × adjustment
-        base_rate = torch.exp(self.log_base_rate)  # scalar, ~4.0
+        base_rate = torch.exp(self.log_base_rate.to(net_dtype))  # scalar, ~4.0
         rate = base_rate * adjustment               # (B,)
 
         # Duration = rate × text_byte_len
-        frames = rate * text_len_f
+        frames = rate * text_len_net
 
+        # Keep rate/frames in fp32 (net_dtype): they are tiny scalars, and
+        # compute_loss takes log() + L1 against an fp32 target — returning fp16
+        # here would reintroduce a dtype mismatch in the loss. predict_duration
+        # only calls .item(), so fp32 is fine there too.
         return {"frames": frames, "rate": rate}
 
     def compute_loss(

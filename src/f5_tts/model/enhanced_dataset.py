@@ -55,6 +55,10 @@ class EnhancedDataset(Dataset):
         self.emotion_raw_dim = emotion_raw_dim
         self.speed_perturb = speed_perturb
         self.training = True  # set to False for val dataset
+        if speed_perturb and embedding_cache_dir is not None:
+            print("  ⚠ speed_perturb disabled: incompatible with cached frame-level "
+                  "embeddings (emotion_frame/prosody_raw are tied to original frame "
+                  "positions). Re-extract embeddings on-the-fly to use speed_perturb.")
 
         if not preprocessed_mel:
             self.mel_spectrogram = default(
@@ -122,21 +126,22 @@ class EnhancedDataset(Dataset):
                 audio = audio.mean(dim=0, keepdim=True)
             if sr != self.target_sample_rate:
                 audio = torchaudio.transforms.Resample(sr, self.target_sample_rate)(audio)
-            # Speed perturbation: random 0.9-1.1× speed during training
-            # Improves generalisation to different speaking rates.
-            # Disabled during eval (speed_perturb=False in val dataset).
-            if self.speed_perturb and self.training:
+            # Speed perturbation: random 0.9-1.1× speed during training.
+            # ONLY safe when no cached frame-level embeddings are used —
+            # perturbing audio changes mel frame count, but cached
+            # emotion_frame_raw / prosody_raw are tied to the ORIGINAL frame
+            # positions. Perturbing would desync conditioning from mel frames.
+            # → disabled automatically when embedding_cache_dir is set.
+            if self.speed_perturb and self.training and self.embedding_cache_dir is None:
                 speed = 0.9 + torch.rand(1).item() * 0.2  # [0.9, 1.1]
-                effects = [["speed", str(speed)], ["rate", str(self.target_sample_rate)]]
-                audio_np = audio.squeeze(0).numpy()
-                import sox
+                effects = [["speed", f"{speed:.4f}"], ["rate", str(self.target_sample_rate)]]
                 try:
                     import torchaudio.sox_effects as sox_fx
                     audio, _ = sox_fx.apply_effects_tensor(
                         audio, self.target_sample_rate, effects, channels_first=True
                     )
                 except Exception:
-                    pass  # skip perturbation if sox unavailable
+                    pass  # sox unavailable → skip perturbation
             mel_spec = self.mel_spectrogram(audio).squeeze(0)
 
         result = {"mel_spec": mel_spec, "text": row["text"]}
@@ -279,6 +284,14 @@ def collate_fn(batch: list[dict]) -> dict:
                 padded.append(a)
             result["raw_audio"] = torch.stack(padded)
             result["raw_audio_present"] = torch.tensor([a is not None for a in audios], dtype=torch.bool)
+            # True per-row sample counts BEFORE zero-padding, in raw_audio's sample
+            # rate (the dataset's target_sample_rate). Online speaker/emotion
+            # encoders need these to mask trailing padding silence — without them
+            # WavLM/emotion pool over the zero tail and contaminate the embedding.
+            # None rows get length 0 (already flagged via raw_audio_present=False).
+            result["raw_audio_lengths"] = torch.tensor(
+                [0 if a is None else a.shape[0] for a in audios], dtype=torch.long
+            )
             sr_item = next((item for item in batch if "sample_rate" in item), None)
             if sr_item is not None:
                 result["sample_rate"] = sr_item["sample_rate"]

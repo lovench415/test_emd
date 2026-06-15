@@ -85,12 +85,17 @@ class DynamicBatchSampler(Sampler[list[int]]):
 
         def _iter_with_reshuffle():
             remaining = list(batches)
+            i = 0
             step = 0
-            while remaining:
-                yield remaining.pop(0)
+            while i < len(remaining):
+                yield remaining[i]
+                i += 1
                 step += 1
-                if step % self.rebuild_every_n_steps == 0 and remaining:
-                    random.shuffle(remaining)
+                if step % self.rebuild_every_n_steps == 0 and i < len(remaining):
+                    # Reshuffle only the not-yet-yielded tail (O(tail) not O(N))
+                    tail = remaining[i:]
+                    random.shuffle(tail)
+                    remaining[i:] = tail
         return _iter_with_reshuffle()
 
     def __len__(self):
@@ -161,12 +166,16 @@ class BucketDynamicBatchSampler(Sampler[list[int]]):
 
         def _iter_with_reshuffle():
             remaining = list(self.batches)
+            i = 0
             step = 0
-            while remaining:
-                yield remaining.pop(0)
+            while i < len(remaining):
+                yield remaining[i]
+                i += 1
                 step += 1
-                if step % self.rebuild_every_n_steps == 0 and remaining:
-                    random.shuffle(remaining)
+                if step % self.rebuild_every_n_steps == 0 and i < len(remaining):
+                    tail = remaining[i:]
+                    random.shuffle(tail)
+                    remaining[i:] = tail
         return _iter_with_reshuffle()
 
     def __len__(self):
@@ -360,16 +369,22 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
             for batch in self.batches:
                 yield batch
         else:
-            # Mid-epoch rebuild: re-shuffle batches every N steps
-            # Keeps diversity high without O(N²) full rebuild each time
+            # Mid-epoch reshuffle of not-yet-yielded batches.
+            # Index-based (no pop(0)) → O(N) total, not O(N²).
+            remaining = list(self.batches)
+            i = 0
             step = 0
-            batches = list(self.batches)  # copy so we can reshuffle
-            while batches:
-                yield batches.pop(0)
+            while i < len(remaining):
+                yield remaining[i]
+                i += 1
                 step += 1
-                if step % self.rebuild_every_n_steps == 0 and batches:
-                    # Reshuffle remaining batches — fast, no dataset access
-                    self._shuffle_batches(batches)
+                if step % self.rebuild_every_n_steps == 0 and i < len(remaining):
+                    # Independent shuffle each time (no fixed seed) — reshuffle
+                    # tail only. random.shuffle is in-place and unseeded → each
+                    # reshuffle within an epoch is independently random.
+                    tail = remaining[i:]
+                    random.shuffle(tail)
+                    remaining[i:] = tail
 
     def __len__(self):
         return len(self.batches)
@@ -479,13 +494,41 @@ class SpeakerBalancedDynamicBatchSampler(Sampler[list[int]]):
                     # return unconsumed plus any trailing items
                     consumed = set(local_added)
                     speaker_to_indices[sp] = [i for i in speaker_to_indices[sp] if i not in consumed]
+                elif local_added and not remaining:
+                    # Speaker is EXHAUSTED: it had fewer than samples_per_speaker
+                    # items left, and none were blocked by batch limits (remaining
+                    # is empty). Returning them would leave speaker_to_indices[sp]
+                    # non-empty forever → active_speakers never shrinks → infinite
+                    # loop in the while-loop. Take the partial group and consume
+                    # them so the speaker empties out.
+                    batch.extend(local_added)
+                    frames += local_frames
+                    kept_speakers += 1
+                    consumed = set(local_added)
+                    speaker_to_indices[sp] = [i for i in speaker_to_indices[sp] if i not in consumed]
                 else:
-                    # could not satisfy full quota for this speaker in this batch
+                    # Could not fill the quota because batch limits (max_samples /
+                    # frames_threshold) blocked items (remaining is non-empty), or
+                    # nothing could be added at all. Return everything so these
+                    # samples are retried in a later batch. Safe from infinite loop:
+                    # this branch only runs when the batch already holds items from
+                    # other speakers (so the batch will be emitted and limits reset),
+                    # or local_added is empty (speaker contributed nothing this round
+                    # but its items remain available as the batch frees up).
                     speaker_to_indices[sp] = local_added + remaining + [i for i in speaker_to_indices[sp] if i not in local_added and i not in remaining]
 
             if kept_speakers > 0 and (not self.drop_residual or kept_speakers == len(chosen_speakers)):
                 batch.sort(key=lambda i: data_source.get_frame_len(i))
                 batches.append(batch)
+
+            # Termination guard: if no speaker contributed any samples this round,
+            # speaker_to_indices cannot shrink and active_speakers would stay the
+            # same → infinite loop. This can only happen when every remaining
+            # sample is individually un-batchable under the current constraints;
+            # stop rather than spin. (The partial-group consumption above handles
+            # the common exhausted-speaker case; this is the final backstop.)
+            if kept_speakers == 0:
+                break
 
             active_speakers = [sp for sp in active_speakers if speaker_to_indices[sp]]
             rng.shuffle(active_speakers)

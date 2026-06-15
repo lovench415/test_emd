@@ -9,6 +9,7 @@ Extends the original with:
 from __future__ import annotations
 from typing import Callable
 from collections import Counter
+from dataclasses import replace as dataclass_replace
 import random as pyrandom
 import torch
 import torch.nn.functional as F
@@ -47,6 +48,8 @@ class EnhancedCFM(nn.Module):
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str, int] | None = None,
         use_duration_predictor: bool = False,
+        duration_speaker_dropout: float = 0.0,
+        duration_speaker_bottleneck: int = 0,
         speaker_emb_dim: int = 512,
     ):
         super().__init__()
@@ -105,6 +108,8 @@ class EnhancedCFM(nn.Module):
                 prosody_global_dim=PROSODY_RAW_DIM,
                 speaker_dim=spk_raw_dim,
                 use_speaker=True,
+                speaker_dropout=duration_speaker_dropout,
+                speaker_bottleneck=duration_speaker_bottleneck,
             )
 
     @property
@@ -128,6 +133,41 @@ class EnhancedCFM(nn.Module):
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
         return text
+
+    @staticmethod
+    def _cat_conditions_for_branches(parts: list) -> "ModelConditionBatch | None":
+        """Concatenate ModelConditionBatch objects along the batch dim for
+        batched-CFG (one transformer call for all guidance branches).
+
+        Robust to differing None-patterns between parts (e.g. an explicit
+        uncond_conditions with fewer fields than the full conditions): a field
+        that is None in one part but a tensor in another is filled with zeros
+        of the reference shape, and its boolean mask/present partner is filled
+        with False — so those rows contribute nothing, exactly like a None
+        field would in a separate call."""
+        if all(p is None for p in parts):
+            return None
+        from dataclasses import fields as _dc_fields
+        ref_part = next(p for p in parts if p is not None)
+        bool_fields = {"speaker_present", "emotion_global_present", "emotion_frame_mask", "prosody_mask"}
+        out = {}
+        for f in _dc_fields(ref_part):
+            name = f.name
+            vals = [getattr(p, name, None) if p is not None else None for p in parts]
+            if all(v is None for v in vals):
+                out[name] = None
+                continue
+            ref = next(v for v in vals if v is not None)
+            filled = []
+            for v in vals:
+                if v is not None:
+                    filled.append(v)
+                elif name in bool_fields:
+                    filled.append(torch.zeros_like(ref, dtype=torch.bool))
+                else:
+                    filled.append(torch.zeros_like(ref))
+            out[name] = torch.cat(filled, dim=0)
+        return type(ref_part)(**out)
 
     def _build_conditioning_runtime(self, conditions: ModelConditionBatch | None, *, drop_speaker=False, drop_emotion=False, drop_prosody=False):
         if conditions is None and self.condition_lifecycle is None:
@@ -194,14 +234,15 @@ class EnhancedCFM(nn.Module):
         no_ref_audio=False, duplicate_test=False, t_inter=0.1, edit_mask=None,
         conditions: ModelConditionBatch | None = None,
         emotion_cfg_strength=0.0, prosody_cfg_strength=0.0,
+        batched_cfg: bool = True,
     ):
         """
         Sample with optional 4-branch EG-CFG for independent emotion/prosody control.
 
-        4-branch EG-CFG:
-            result = f + cfg·(f − u)
-                     + emo·(f − e)          ← emotion boost
-                     + pros·(e − v)          ← prosody boost
+        4-branch EG-CFG (telescoping decomposition — non-overlapping terms):
+            result = f + cfg·(v − u)         ← speaker/text/audio guidance (voice base)
+                     + emo·(f − e)           ← emotion contribution only
+                     + pros·(e − v)          ← prosody contribution only
 
         where:
             f = p_full:    speaker + emotion + prosody + text + audio
@@ -209,16 +250,27 @@ class EnhancedCFM(nn.Module):
             v = p_voice:   speaker + text + audio            (emotion + prosody dropped)
             u = p_uncond:  all conditions dropped
 
-        Decomposition:
-            (f − e) = what emotion adds beyond (speaker + prosody)
-            (e − v) = what prosody adds beyond (speaker only)
-            (f − u) = total conditioning signal
+        Decomposition (each difference removes exactly ONE axis, so the three
+        guidance terms are orthogonal and never double-count a signal):
+            (v − u) = what speaker+text+audio add beyond nothing
+            (e − v) = what prosody adds beyond voice
+            (f − e) = what emotion adds beyond (voice + prosody)
+        With cfg == emo == pros, the three terms telescope exactly to (f − u),
+        i.e. standard total-conditioning guidance, but with independent knobs.
+
+        NOTE (behavioural change vs. naive 4-branch): the base guidance term is
+        (v − u), NOT (f − u). Using (f − u) double-counts emotion and prosody
+        because (f − u) already contains their contribution, which the emo/pros
+        terms then add again. (v − u) carries no expression signal, so emotion
+        and prosody are each amplified exactly once.
 
         Edge cases:
-            emo=0, pros=0  →  f + cfg·(f−u)                = standard 2-way CFG
-            emo>0, pros=0  →  f + cfg·(f−u) + emo·(f−e)    = 3-branch (emotion)
-            emo=0, pros>0  →  f + cfg·(f−u) + pros·(e−v)   = 4-branch (prosody)
-            emo>0, pros>0  →  full 4-branch                 = independent control
+            emo=0, pros=0  →  f + cfg·(v−u)                = speaker/text/audio CFG
+                              (NOT bit-identical to f+cfg·(f−u): expression is no
+                               longer folded into the base term — by design)
+            emo>0, pros=0  →  f + cfg·(v−u) + emo·(f−e)
+            emo=0, pros>0  →  f + cfg·(v−u) + pros·(e−v)
+            emo>0, pros>0  →  full telescoping 4-branch    = independent control
         """
         self.eval()
 
@@ -301,9 +353,21 @@ class EnhancedCFM(nn.Module):
         # weights, but direct addition has no such mechanism — it blindly adds
         # fake prosody to generated frames, distorting the output.
         # Training is unaffected (prosody covers the full utterance there).
+        #
+        # Build a NEW ModelConditionBatch instead of mutating the field in place:
+        # prepare()/make_condition_pair pass the caller's `conditions` object
+        # through by reference, so assigning model_conditions.prosody_direct here
+        # would mutate the caller's object and make sample() non-idempotent
+        # (a second call with a different cond_mask would re-mask already-zeroed
+        # frames, progressively destroying prosody). dataclass_replace yields a
+        # shallow copy: only prosody_direct is swapped, every other tensor field
+        # remains the same reference (none of which we mutate).
         if model_conditions is not None and model_conditions.prosody_direct is not None:
             ref_region = cond_mask.unsqueeze(-1).to(model_conditions.prosody_direct.dtype)
-            model_conditions.prosody_direct = model_conditions.prosody_direct * ref_region
+            model_conditions = dataclass_replace(
+                model_conditions,
+                prosody_direct=model_conditions.prosody_direct * ref_region,
+            )
 
         cond_runtime = self._build_conditioning_runtime(model_conditions) if model_conditions is not None else None
         uncond_runtime = self._build_conditioning_runtime(uncond_conditions) if uncond_conditions is not None else None
@@ -315,26 +379,113 @@ class EnhancedCFM(nn.Module):
             if use_expression_cfg and model_conditions is not None else None
         )
         # voice_runtime: drop emotion + prosody. Speaker identity only.
-        # Only needed when prosody_cfg > 0 (to isolate prosody contribution).
+        # Needed WHENEVER expression CFG is active: v is the base of the
+        # telescoping guidance term (v − u), and also the upper end of the
+        # prosody term (e − v). (Previously only built for prosody CFG, which
+        # was wrong once the base term switched from (f−u) to (v−u).)
         voice_runtime = (
             self._build_conditioning_runtime(model_conditions, drop_emotion=True, drop_prosody=True)
-            if use_pros_cfg and model_conditions is not None else None
+            if use_expression_cfg and model_conditions is not None else None
         )
 
+        # ── Batched CFG: ONE transformer call for all guidance branches ──
+        # Sequential branches cost n forwards per ODE step (n=2..4). Stacking
+        # branches along the batch dim computes them in one forward — identical
+        # math, ~n× fewer kernel launches (near-n× wall-time when GPU has
+        # capacity). Branch layout (block-wise along batch):
+        #   expression: [f | u | v | (e)]   plain CFG: [cond | uncond]
+        # Per-row knobs that differ between branches are all per-sample-capable:
+        #   transformer drop_audio_cond/drop_text (tensor),
+        #   runtime drops via build_runtime(drop_*=tensor).
+        # Trade-off: peak activation memory scales with n (disable via
+        # batched_cfg=False if OOM on very long sequences).
+        use_cfg = cfg_strength >= 1e-5
+        batched_runtime = None
+        batched_drop_audio = None
+        n_branches = 0
+        if batched_cfg and (use_cfg or use_expression_cfg):
+            B = step_cond.shape[0]
+            dev = step_cond.device
+            uc_part = uncond_conditions if uncond_conditions is not None else model_conditions
+            if use_expression_cfg:
+                n_branches = 4 if (use_emo_cfg or use_pros_cfg) else 3
+                parts = [model_conditions, uc_part, model_conditions] + (
+                    [model_conditions] if n_branches == 4 else []
+                )
+                z = torch.zeros(B, dtype=torch.bool, device=dev)
+                o = torch.ones(B, dtype=torch.bool, device=dev)
+                # rows:        f  u  v  (e)
+                drop_emo_rows = [z, z, o] + ([o] if n_branches == 4 else [])
+                drop_pros_rows = [z, z, o] + ([z] if n_branches == 4 else [])
+                batched_drop_audio = torch.cat([z, o] + [z] * (n_branches - 2))
+                merged = self._cat_conditions_for_branches(parts)
+                batched_runtime = (
+                    self.condition_lifecycle.build_runtime(
+                        merged,
+                        drop_emotion=torch.cat(drop_emo_rows),
+                        drop_prosody=torch.cat(drop_pros_rows),
+                    ) if merged is not None else None
+                )
+            elif use_cfg:
+                n_branches = 2
+                z = torch.zeros(B, dtype=torch.bool, device=dev)
+                o = torch.ones(B, dtype=torch.bool, device=dev)
+                batched_drop_audio = torch.cat([z, o])
+                merged = self._cat_conditions_for_branches([model_conditions, uc_part])
+                batched_runtime = (
+                    self.condition_lifecycle.build_runtime(merged)
+                    if merged is not None else None
+                )
+
+        def _fn_batched(t, x):
+            n = n_branches
+            xs = torch.cat([x] * n, dim=0)
+            conds = torch.cat([step_cond] * n, dim=0)
+            texts = torch.cat([text] * n, dim=0)
+            masks = torch.cat([mask] * n, dim=0) if mask is not None else None
+            da = batched_drop_audio
+            out = self.transformer(
+                x=xs, cond=conds, text=texts, time=t, mask=masks,
+                cache=False,
+                drop_audio_cond=da, drop_text=da,
+                conditioning_runtime=batched_runtime,
+            ).float()
+            chunks = out.chunk(n, dim=0)
+            if use_expression_cfg:
+                f, u, v = chunks[0], chunks[1], chunks[2]
+                result = f + cfg_strength * (v - u)
+                if n == 4:
+                    e = chunks[3]
+                    if use_emo_cfg:
+                        result = result + emotion_cfg_strength * (f - e)
+                    if use_pros_cfg:
+                        result = result + prosody_cfg_strength * (e - v)
+                return result.to(x.dtype)
+            p_cond, p_uncond = chunks[0], chunks[1]
+            return (p_cond + (p_cond - p_uncond) * cfg_strength).to(x.dtype)
+
         def fn(t, x):
+            if batched_cfg and n_branches >= 2:
+                return _fn_batched(t, x)
             kw = dict(cond=step_cond, text=text, time=t, mask=mask)
 
             if cfg_strength < 1e-5 and not use_expression_cfg:
                 return self.transformer(x=x, **kw, cache=True, conditioning_runtime=cond_runtime)
 
             if use_expression_cfg:
-                # ── 4-branch EG-CFG ──
+                # ── Telescoping 4-branch EG-CFG ──
                 # f = full, e = no_emotion, v = voice, u = uncond
                 #
-                # result = f + cfg·(f−u) + emo·(f−e) + pros·(e−v)
+                # result = f + cfg·(v−u) + emo·(f−e) + pros·(e−v)
+                #
+                # Each difference removes exactly one axis → terms are
+                # orthogonal (no double-counting of emotion/prosody).
                 #
                 # Branches built:
-                #   f always, u always, e if emo or pros, v if pros.
+                #   f always (centre point of the guidance expansion)
+                #   v always (base of (v−u) and top of (e−v))
+                #   u always (base of (v−u))
+                #   e only when emo or pros CFG is active (needed for (f−e)/(e−v))
 
                 f = self.transformer(
                     x=x, **kw, cache=False,
@@ -347,7 +498,15 @@ class EnhancedCFM(nn.Module):
                     conditioning_runtime=(uncond_runtime if uncond_runtime is not None else cond_runtime),
                 ).float()
 
-                result = f + cfg_strength * (f - u)
+                v = self.transformer(
+                    x=x, **kw, cache=False,
+                    conditioning_runtime=voice_runtime,
+                ).float()
+
+                # Base guidance: speaker/text/audio relative to full uncond.
+                # Carries NO expression signal, so emotion/prosody are not
+                # amplified here and stay independent of cfg_strength.
+                result = f + cfg_strength * (v - u)
 
                 if use_emo_cfg or use_pros_cfg:
                     e = self.transformer(
@@ -359,10 +518,6 @@ class EnhancedCFM(nn.Module):
                         result = result + emotion_cfg_strength * (f - e)
 
                     if use_pros_cfg:
-                        v = self.transformer(
-                            x=x, **kw, cache=False,
-                            conditioning_runtime=voice_runtime,
-                        ).float()
                         result = result + prosody_cfg_strength * (e - v)
 
                 return result.to(x.dtype)
@@ -380,10 +535,16 @@ class EnhancedCFM(nn.Module):
             return (p_cond.float() + (p_cond.float() - p_uncond.float()) * cfg_strength).to(dtype_orig)
 
         # Initial noise
+        # Seed ONCE before the loop, not per-iteration. Re-seeding inside the
+        # loop reset the RNG to the same state before every sample, so every
+        # batch row received identical initial noise (rows differing only by
+        # length via a shared prefix) — defeating batched generation. Seeding
+        # once keeps the result reproducible while giving each row distinct noise
+        # as the generator stream advances.
+        if exists(seed):
+            torch.manual_seed(seed)
         y0 = []
         for dur in duration:
-            if exists(seed):
-                torch.manual_seed(seed)
             y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
@@ -421,8 +582,12 @@ class EnhancedCFM(nn.Module):
     ):
         """Training forward with multi-condition dropout.
 
-        Returns: (flow_loss, cond, pred, mode_names, dur_loss)
-            dur_loss is 0.0 tensor if duration_predictor is None or inputs missing.
+        Returns: (flow_loss, cond, pred, mode_names, dur_loss, per_sample_loss)
+            flow_loss:       scalar, batch mean over masked frames (the training target)
+            dur_loss:        0.0 tensor if duration_predictor is None or inputs missing.
+            per_sample_loss: (B,) per-sample masked-frame mean, NaN where a sample
+                             had no masked frames. Aligned with mode_names for exact
+                             per-mode loss attribution in the trainer.
         """
         inp = self._to_mel(inp)
         batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, self.device
@@ -450,6 +615,11 @@ class EnhancedCFM(nn.Module):
         dropout = self.sample_condition_dropout(batch, device)
         mode_names = dropout["mode_names"]
 
+        # NOTE: frame-level conditions are passed through unchanged (matches the
+        # known-good training regime). An experimental span-mask (zeroing
+        # prosody/emotion over the reconstructed span to prevent "peeking") was
+        # tried and reverted: the proven version does not mask, and it does not
+        # leak; the cross-language leak was traced to the ref_text prefix.
         model_conditions = conditions
 
         cond_out = self._build_conditioning_runtime(
@@ -467,6 +637,18 @@ class EnhancedCFM(nn.Module):
         loss = F.mse_loss(pred, flow, reduction="none")
         masked = loss[rand_span_mask]
 
+        # Per-sample loss (B,) for exact per-mode attribution in the trainer.
+        # mode_names[i] corresponds to sample i, so the trainer can group these
+        # without smearing the whole batch mean across every present mode.
+        # Mean over each sample's masked frames; samples with no masked frames
+        # get NaN here (sum/0) — the trainer skips those when aggregating.
+        with torch.no_grad():
+            per_frame = loss.mean(dim=-1)                       # (B, T) mean over channels
+            span = rand_span_mask.to(per_frame.dtype)           # (B, T)
+            frames_per_sample = span.sum(dim=1)                 # (B,)
+            per_sample_loss = (per_frame * span).sum(dim=1) / frames_per_sample.clamp_min(1)
+            per_sample_loss = per_sample_loss.masked_fill(frames_per_sample == 0, float("nan"))
+
         # Duration predictor loss (parallel head, does not affect flow matching gradient)
         dur_loss = torch.tensor(0.0, device=device)
         if (self.duration_predictor is not None
@@ -480,5 +662,5 @@ class EnhancedCFM(nn.Module):
             )
 
         if masked.numel() == 0:
-            return (pred * 0.0).sum(), cond, pred, mode_names, dur_loss
-        return masked.mean(), cond, pred, mode_names, dur_loss
+            return (pred * 0.0).sum(), cond, pred, mode_names, dur_loss, per_sample_loss
+        return masked.mean(), cond, pred, mode_names, dur_loss, per_sample_loss

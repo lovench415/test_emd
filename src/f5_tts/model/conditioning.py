@@ -36,7 +36,7 @@ class ConditioningAdaLN(nn.Module):
 
 
 class ConditioningCrossAttention(nn.Module):
-    def __init__(self, model_dim: int, cond_dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0):
+    def __init__(self, model_dim: int, cond_dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0, gate_floor: float = 0.0):
         super().__init__()
         inner_dim = heads * dim_head
         self.heads, self.dim_head = heads, dim_head
@@ -46,10 +46,36 @@ class ConditioningCrossAttention(nn.Module):
         self.to_k = nn.Linear(cond_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(cond_dim, inner_dim, bias=False)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, model_dim), nn.Dropout(dropout))
-        # Gate=0.15 → tanh(0.15)=0.149: projection gets ~15% gradient from start.
-        # Lower values (0.02) caused cross-attn to stay dead for 22K+ steps
-        # because gradient was too weak for the 6-step attention chain.
-        self.gate = nn.Parameter(torch.full((1,), 0.15))
+        # Zero-init output projection (consistent with AdaLN, input_add, fusion).
+        # → residual starts at exactly 0 (no noise injected into DiT stream at init).
+        # to_out still receives gradient via gate=0.15, so it learns immediately;
+        # gate begins adapting once to_out produces non-zero output (a few steps).
+        nn.init.zeros_(self.to_out[0].weight)
+        nn.init.zeros_(self.to_out[0].bias)
+        # Gate=0.15 → tanh(0.15)=0.149: passes gradient to projection from start.
+        # When a floor is active, the effective-gate mapping would otherwise shift
+        # the init upward (e.g. 0.149→0.6), starting cross-attn far too strong.
+        # Re-solve the init so the EFFECTIVE gate still starts at ~0.149.
+        self.gate_floor = gate_floor
+        if gate_floor > 0:
+            import math
+            target = 0.149
+            # invert: target = floor + (1-floor)*0.5*(tanh(g)+1)
+            t = 2.0 * (target - gate_floor) / (1.0 - gate_floor) - 1.0
+            t = max(min(t, 0.999), -0.999)
+            init_gate = math.atanh(t)
+        else:
+            init_gate = 0.15
+        self.gate = nn.Parameter(torch.full((1,), float(init_gate)))
+
+    def _effective_gate(self) -> torch.Tensor:
+        # tanh(gate) ∈ (-1,1). With a floor f, map the usual non-negative range
+        # so the effective multiplier never drops below f while staying smooth
+        # and keeping a live gradient w.r.t. `gate`.
+        g = torch.tanh(self.gate)
+        if self.gate_floor > 0:
+            return self.gate_floor + (1.0 - self.gate_floor) * 0.5 * (g + 1.0)
+        return g
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor, cond_mask: torch.Tensor | None = None, x_mask: torch.Tensor | None = None) -> torch.Tensor:
         B = x.shape[0]
@@ -78,7 +104,9 @@ class ConditioningCrossAttention(nn.Module):
         # Gate init=0.15 (tanh=0.149): high enough for projection to get
         # meaningful gradient from the start. clamp(min=) was wrong — it killed
         # gradient for gate parameter (stuck in clamped region forever).
-        residual = torch.tanh(self.gate) * self.to_out(out)
+        # _effective_gate() applies an optional floor that keeps the path alive
+        # WITHOUT freezing the gate gradient (anti death-spiral).
+        residual = self._effective_gate() * self.to_out(out)
         residual = residual * row_has_cond[:, None, None].to(residual.dtype)
         if x_mask is not None:
             residual = residual * x_mask[..., None].to(residual.dtype)
@@ -105,7 +133,7 @@ class _FusionCrossAttn(nn.Module):
     Unlike ConditioningCrossAttention (designed for DiT blocks with model_dim queries),
     this handles arbitrary query/key dims for inter-conditioning fusion.
     """
-    def __init__(self, q_dim: int, kv_dim: int, heads: int = 4, dim_head: int = 64):
+    def __init__(self, q_dim: int, kv_dim: int, heads: int = 4, dim_head: int = 64, gate_floor: float = 0.0):
         super().__init__()
         inner = heads * dim_head
         self.heads, self.dim_head = heads, dim_head
@@ -118,7 +146,21 @@ class _FusionCrossAttn(nn.Module):
         # proj=zero so no random noise; gate=0.15 provides gradient for proj.
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
-        self.gate = nn.Parameter(torch.full((1,), 0.15))
+        self.gate_floor = gate_floor
+        if gate_floor > 0:
+            import math
+            t = 2.0 * (0.149 - gate_floor) / (1.0 - gate_floor) - 1.0
+            t = max(min(t, 0.999), -0.999)
+            init_gate = math.atanh(t)
+        else:
+            init_gate = 0.15
+        self.gate = nn.Parameter(torch.full((1,), float(init_gate)))
+
+    def _effective_gate(self) -> torch.Tensor:
+        g = torch.tanh(self.gate)
+        if self.gate_floor > 0:
+            return self.gate_floor + (1.0 - self.gate_floor) * 0.5 * (g + 1.0)
+        return g
 
     def forward(self, x, cond, cond_mask=None, x_mask=None):
         B = x.shape[0]
@@ -148,7 +190,7 @@ class _FusionCrossAttn(nn.Module):
             bias = None
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         out = out.transpose(1, 2).reshape(B, -1, self.heads * self.dim_head)
-        residual = torch.tanh(self.gate) * self.to_out(out)
+        residual = self._effective_gate() * self.to_out(out)
         # Zero residual for rows with no valid conditioning (prevents NaN leak)
         if row_has_cond is not None:
             residual = residual * row_has_cond[:, None, None].to(residual.dtype)
@@ -173,13 +215,13 @@ class EmoProsodyFusion(nn.Module):
 
     def __init__(
         self, emotion_dim: int = 512, prosody_dim: int = 256,
-        heads: int = 4, dim_head: int = 64,
+        heads: int = 4, dim_head: int = 64, cross_attn_gate_floor: float = 0.0,
     ):
         super().__init__()
         # Emotion queries prosody: "what pitch/energy/rhythm matches this emotion?"
-        self.emo_attends_pros = _FusionCrossAttn(emotion_dim, prosody_dim, heads, dim_head)
+        self.emo_attends_pros = _FusionCrossAttn(emotion_dim, prosody_dim, heads, dim_head, gate_floor=cross_attn_gate_floor)
         # Prosody queries emotion: "what emotion context enriches this pitch contour?"
-        self.pros_attends_emo = _FusionCrossAttn(prosody_dim, emotion_dim, heads, dim_head)
+        self.pros_attends_emo = _FusionCrossAttn(prosody_dim, emotion_dim, heads, dim_head, gate_floor=cross_attn_gate_floor)
 
     def forward(
         self,
@@ -221,10 +263,20 @@ class ConditioningAggregator(nn.Module):
         prosody_dim: int = 256,
         prosody_raw_dim: int | None = None,
         use_prosody_cross_attn: bool = True,
+        use_prosody_direct: bool = True,   # set False to use ONLY cross-attn for
+                                           # prosody (avoids direct↔cross-attn
+                                           # competition on the same layers/signal)
         prosody_cross_attn_layers: list[int] | None = None,
         prosody_cross_attn_heads: int = 8,
         prosody_cross_attn_dim_head: int = 64,
         prosody_direct_layers: list[int] | None = None,
+        # Anti-overfitting on speaker (esp. for few-speaker datasets):
+        speaker_emb_dropout: float = 0.0,   # dropout on raw speaker embedding
+        speaker_emb_noise: float = 0.0,     # gaussian noise std on speaker embedding (train only)
+        fusion_mode: str = "concat",        # "concat" (default) or "residual"
+                                            # (speaker-guaranteed; see fusion build)
+        cross_attn_gate_floor: float = 0.0, # floor on effective cross-attn gate
+                                            # (anti death-spiral); 0.0 = off
     ):
         super().__init__()
         self.speaker_dim = speaker_dim
@@ -235,6 +287,9 @@ class ConditioningAggregator(nn.Module):
         self.use_input_add = use_input_add
         self.use_cross_attn = use_cross_attn
         self.use_prosody_cross_attn = use_prosody_cross_attn
+        self.speaker_emb_noise = speaker_emb_noise
+        self.speaker_emb_dropout_p = speaker_emb_dropout
+        self.speaker_emb_dropout = nn.Dropout(speaker_emb_dropout) if speaker_emb_dropout > 0 else None
 
         self.speaker_raw_proj = nn.Linear(speaker_raw_dim, speaker_dim) if speaker_raw_dim else None
         self.emotion_raw_proj = nn.Linear(emotion_raw_dim, emotion_dim) if emotion_raw_dim else None
@@ -257,29 +312,40 @@ class ConditioningAggregator(nn.Module):
         # Init: proj=zero (no noise), gate=0.02 (provides gradient for proj).
         # Kaiming proj + zero gate caused garbled speech: gate gets huge gradient
         # from random proj output → noise injected at 22 blocks before proj learns.
+        self.use_prosody_direct = use_prosody_direct
+        # prosody DIRECT path — only built if enabled AND prosody is used.
+        # Disabling it leaves prosody handled solely by cross-attention, removing
+        # the direct↔cross-attn competition on the same [2,6,10,14,18] layers.
+        _build_direct = bool(prosody_raw_dim) and use_prosody_direct
         self.prosody_direct_proj = (
             nn.Sequential(
                 nn.Linear(prosody_raw_dim, model_dim),
                 nn.SiLU(),
                 nn.Linear(model_dim, model_dim),
             )
-            if prosody_raw_dim else None
+            if _build_direct else None
         )
         if self.prosody_direct_proj is not None:
             nn.init.zeros_(self.prosody_direct_proj[-1].weight)
             nn.init.zeros_(self.prosody_direct_proj[-1].bias)
 
         # Temporal smoothing for direct prosody path (depthwise conv, shared)
+        # Zero-init bias: with zero-init prosody_direct_proj, the proj output is 0.
+        # conv(0) = conv_bias, so a non-zero bias would make the path output
+        # conv_bias → F.normalize amplifies it to unit norm → noise injected at
+        # init despite zero-init proj. Zero bias keeps conv(0)=0 → normalize(0)=0.
         self.prosody_temporal_smooth = (
             nn.Conv1d(model_dim, model_dim, kernel_size=5, padding=2, groups=model_dim)
-            if prosody_raw_dim else None
+            if _build_direct else None
         )
+        if self.prosody_temporal_smooth is not None:
+            nn.init.zeros_(self.prosody_temporal_smooth.bias)
 
         # Prosody direct: apply at SUBSET of blocks (not all 22) to match
         # cross-attention's gradient budget. Default = same as prosody_cross_attn.
         # Per-block gates stored for ALL n_blocks (checkpoint compat); only
         # gates at active layers receive gradient.
-        if prosody_raw_dim:
+        if _build_direct:
             if prosody_direct_layers is None:
                 prosody_direct_layers = prosody_cross_attn_layers or list(range(2, n_blocks, 4))
             self.prosody_direct_layers = set(prosody_direct_layers)
@@ -302,9 +368,33 @@ class ConditioningAggregator(nn.Module):
             nn.init.zeros_(self.prosody_global_proj[-1].bias)
             self.prosody_global_gate = nn.Parameter(torch.full((1,), 0.15))
 
-        self.fusion = nn.Sequential(nn.Linear(speaker_dim + emotion_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim))
-        nn.init.zeros_(self.fusion[-1].weight)
-        nn.init.zeros_(self.fusion[-1].bias)
+        # Fusion of global speaker + emotion → fused_global (drives AdaLN/input_add).
+        #
+        # "concat" (default): Linear([speaker | emotion]). Both inputs share one
+        #   weight matrix; if emotion's gradient dominates, W_speaker can decay to
+        #   ~0 and the model stops using speaker → voice stops cloning.
+        #
+        # "residual": speaker flows through its OWN projection (always reaches
+        #   fused_global), emotion is added as a GATED correction. Speaker cannot
+        #   be zeroed out structurally; emotion modulates on top. Preserves
+        #   speaker×emotion interaction via the correction's concat input.
+        self.fusion_mode = fusion_mode
+        if fusion_mode == "residual":
+            self.fusion_speaker = nn.Sequential(
+                nn.Linear(speaker_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim)
+            )
+            # speaker path NOT zero-init → speaker always reaches fused_global
+            self.fusion_emotion = nn.Sequential(
+                nn.Linear(speaker_dim + emotion_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim)
+            )
+            nn.init.zeros_(self.fusion_emotion[-1].weight)
+            nn.init.zeros_(self.fusion_emotion[-1].bias)
+            self.fusion_emotion_gate = nn.Parameter(torch.full((1,), 0.15))
+            self.fusion = None  # not used in residual mode
+        else:
+            self.fusion = nn.Sequential(nn.Linear(speaker_dim + emotion_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim))
+            nn.init.zeros_(self.fusion[-1].weight)
+            nn.init.zeros_(self.fusion[-1].bias)
 
         if use_adaln:
             self.adaln_cond = ConditioningAdaLN(model_dim, model_dim, n_blocks, bottleneck_dim=adaln_bottleneck_dim)
@@ -315,7 +405,7 @@ class ConditioningAggregator(nn.Module):
                 cross_attn_layers = list(range(0, n_blocks, 4))
             self.cross_attn_layers = cross_attn_layers
             self.cross_attns = nn.ModuleDict({
-                str(i): ConditioningCrossAttention(model_dim, emotion_dim, cross_attn_heads, cross_attn_dim_head, dropout)
+                str(i): ConditioningCrossAttention(model_dim, emotion_dim, cross_attn_heads, cross_attn_dim_head, dropout, gate_floor=cross_attn_gate_floor)
                 for i in cross_attn_layers
             })
 
@@ -327,7 +417,7 @@ class ConditioningAggregator(nn.Module):
             self.prosody_cross_attns = nn.ModuleDict({
                 str(i): ConditioningCrossAttention(
                     model_dim, prosody_dim, prosody_cross_attn_heads,
-                    prosody_cross_attn_dim_head, dropout,
+                    prosody_cross_attn_dim_head, dropout, gate_floor=cross_attn_gate_floor,
                 )
                 for i in prosody_cross_attn_layers
             })
@@ -335,18 +425,34 @@ class ConditioningAggregator(nn.Module):
         # Emo-prosody fusion: bidirectional cross-attention between emotion and prosody
         # frames before they enter the DiT. Only created when both streams exist.
         self.emo_prosody_fusion = (
-            EmoProsodyFusion(emotion_dim, prosody_dim, heads=4, dim_head=64)
+            EmoProsodyFusion(emotion_dim, prosody_dim, heads=4, dim_head=64, cross_attn_gate_floor=cross_attn_gate_floor)
             if use_cross_attn and use_prosody_cross_attn else None
         )
 
     def _to_model_dtype(self, t: torch.Tensor) -> torch.Tensor:
-        ref = self.fusion[0].weight
+        # In concat mode dtype/device come from self.fusion[0]; in residual mode
+        # self.fusion is None, so fall back to the residual speaker path, then to
+        # any aggregator parameter.
+        if getattr(self, "fusion", None) is not None:
+            ref = self.fusion[0].weight
+        elif getattr(self, "fusion_speaker", None) is not None:
+            ref = self.fusion_speaker[0].weight
+        else:
+            ref = next(self.parameters())
         return t.to(device=ref.device, dtype=ref.dtype)
 
     def project_speaker(self, emb: torch.Tensor | None) -> torch.Tensor | None:
         if emb is None:
             return None
         emb = self._to_model_dtype(emb)
+        # Anti-overfitting (train only): inject gaussian noise + dropout on the
+        # raw speaker embedding so the model generalises to unseen voices instead
+        # of memorising the few training speakers. No effect at eval.
+        if self.training:
+            if self.speaker_emb_noise > 0:
+                emb = emb + torch.randn_like(emb) * self.speaker_emb_noise
+            if self.speaker_emb_dropout is not None:
+                emb = self.speaker_emb_dropout(emb)
         return self.speaker_raw_proj(emb) if self.speaker_raw_proj is not None else emb
 
     def project_emotion(self, emb: torch.Tensor | None) -> torch.Tensor | None:
@@ -537,7 +643,14 @@ class ConditioningAggregator(nn.Module):
 
         speaker_emb = speaker_emb * active_speaker[:, None].to(speaker_emb.dtype)
         emotion_emb = emotion_emb * active_emotion[:, None].to(emotion_emb.dtype)
-        fused = self.fusion(torch.cat([speaker_emb, emotion_emb], dim=-1))
+        if self.fusion_mode == "residual":
+            # Speaker flows through its own projection (always present);
+            # emotion added as a gated correction (cannot zero out speaker).
+            fused = self.fusion_speaker(speaker_emb)
+            emo_corr = self.fusion_emotion(torch.cat([speaker_emb, emotion_emb], dim=-1))
+            fused = fused + torch.tanh(self.fusion_emotion_gate) * emo_corr
+        else:
+            fused = self.fusion(torch.cat([speaker_emb, emotion_emb], dim=-1))
         fused_present = active_speaker | active_emotion
         fused = fused * fused_present[:, None].to(fused.dtype)
         return fused, fused_present
@@ -687,12 +800,24 @@ class ConditioningAggregator(nn.Module):
             MAX_DIRECT_SCALE = 0.1
             n_active = len(self.prosody_direct_layers)
             gate = MAX_DIRECT_SCALE * torch.tanh(self.prosody_block_gates[block_idx]) / n_active
-            # Align lengths (prosody_direct may differ by 1-2 frames from x)
+            # Align T to mel. Small diffs (±1-2 frames) come from hop rounding —
+            # pad/truncate is fine. LARGE diffs signal a real frame-rate mismatch
+            # (wrong sr/hop in extraction); zero-padding there would SHIFT the
+            # prosody contour relative to mel (silent corruption). Interpolate
+            # instead so the contour stays time-aligned to the mel.
             pd = prosody_direct
-            if pd.shape[1] < x.shape[1]:
-                pd = F.pad(pd, (0, 0, 0, x.shape[1] - pd.shape[1]))
-            elif pd.shape[1] > x.shape[1]:
-                pd = pd[:, :x.shape[1], :]
+            T_pd, T_x = pd.shape[1], x.shape[1]
+            if T_pd != T_x:
+                if abs(T_pd - T_x) <= 2:
+                    if T_pd < T_x:
+                        pd = F.pad(pd, (0, 0, 0, T_x - T_pd))
+                    else:
+                        pd = pd[:, :T_x, :]
+                else:
+                    # resample along time to match mel (preserves alignment)
+                    pd = F.interpolate(
+                        pd.transpose(1, 2), size=T_x, mode="linear", align_corners=False
+                    ).transpose(1, 2)
             x = x + gate * pd
         return x
 

@@ -109,6 +109,13 @@ def parse_args():
     g.add_argument("--speed_perturb", action="store_true",
                    help="Randomly perturb reference audio speed (0.9-1.1x) during training. "
                         "Improves generalisation to different speaking rates.")
+    g.add_argument("--ema_decay", type=float, default=0.9999,
+                   help="EMA decay rate. 0.9999 for large datasets/long runs; "
+                        "0.999 for smaller datasets or short staged curriculum.")
+    g.add_argument("--ema_update_after", type=int, default=100,
+                   help="Start EMA updates after this many steps (skip noisy early steps).")
+    g.add_argument("--ema_update_every", type=int, default=1,
+                   help="Update EMA every N steps.")
     g.add_argument("--lr_base_mult", type=float, default=0.1,
                    help="LR multiplier for unfrozen DiT blocks (× base LR).")
     g.add_argument("--lr_speaker_mult", type=float, default=1.0,
@@ -130,19 +137,20 @@ def parse_args():
         "--train_stage", type=int, default=0,
         help="""Curriculum training stage. Each stage adds NEW modules on top of previous.
   0 = all conditioning (default, no curriculum)
-  1 = Speaker     speaker_raw_proj + adaln_cond + input_add
-  2 = Prosody     prosody_global/direct/cross_attn + duration_predictor
-  3 = Emotion     emotion_raw_proj + frame_raw_proj + cross_attns
-  4 = Fusion      emo_prosody_fusion
-  5 = DiT blocks  top-K transformer blocks + norm_out + proj_out
-  6 = All modules joint fine-tuning (use low LR flags)
+  1 = Speaker+Global  speaker_raw_proj + emotion_raw_proj + fusion + adaln + input_add + duration
+  2 = Prosody direct  prosody_direct_proj + temporal_smooth + global_proj + gates
+  3 = Prosody attn    prosody_cross_attns + prosody_raw_proj
+  4 = Emotion attn    frame_raw_proj + cross_attns
+  5 = Fusion          emo_prosody_fusion
+  6 = DiT blocks      top-K transformer blocks + norm_out + proj_out
+Recommended flow: 1 → 2 → 3 → 4 → 5 → (6) → 0 (joint finetune, low LR).
         """
     )
     g.add_argument(
         "--freeze_adaln", action="store_true", default=False,
-        help="On stages 2-4: freeze AdaLN+speaker (keep only the new module trainable). "
+        help="On stages 2-6: freeze AdaLN (keep only the new module trainable). "
              "Use only after stage 1 has fully converged. "
-             "Default: AdaLN stays active on stages 2-4 to stabilise DiT blocks."
+             "Default: AdaLN stays active on stages 2-6 to stabilise DiT blocks."
     )
 
     g = p.add_argument_group("conditioning")
@@ -152,15 +160,52 @@ def parse_args():
     g.add_argument("--emotion_backend", default="emotion2vec_base", choices=list(EMOTION_RAW_DIMS))
     g.add_argument("--no_cross_attn", action="store_true")
     g.add_argument("--no_adaln", action="store_true")
+    g.add_argument("--adaln_bottleneck_dim", type=int, default=256,
+                   help="AdaLN bottleneck width. fused_global is compressed to this "
+                        "dim before producing scale/shift in each block. 256 (default) "
+                        "saves params but can blur fine speaker detail (4:1 compression "
+                        "of 1024). Try 512 for better voice fidelity at +~25M params. "
+                        "NOTE: changing this changes the architecture → retrain required.")
     g.add_argument("--no_input_add", action="store_true")
+    g.add_argument("--speaker_emb_dropout", type=float, default=0.0,
+                   help="Dropout on raw speaker embedding (train only). "
+                        "Anti-overfitting for few-speaker datasets. Try 0.1-0.2 for 5-10 speakers.")
+    g.add_argument("--speaker_emb_noise", type=float, default=0.0,
+                   help="Gaussian noise std added to speaker embedding (train only). "
+                        "Forces generalisation to unseen voices. Try 0.05-0.1 for few speakers.")
 
     g = p.add_argument_group("prosody")
     g.add_argument("--prosody_backend", default="dio", choices=["dio", "harvest", "crepe", "rmvpe"])
     g.add_argument("--prosody_dim", type=int, default=256)
+    g.add_argument("--fusion_mode", default="concat", choices=["concat", "residual"],
+                   help="How global speaker+emotion combine into fused_global. "
+                        "'concat' (default): shared Linear([speaker|emotion]) — emotion "
+                        "can dominate and zero out speaker → voice stops cloning. "
+                        "'residual': speaker has its own path (always reaches output), "
+                        "emotion is a gated correction — speaker can't be zeroed. "
+                        "NOTE: changes architecture → retrain required.")
+    g.add_argument("--cross_attn_gate_floor", type=float, default=0.0,
+                   help="Floor on the EFFECTIVE cross-attn gate to prevent the death spiral (gate→0 → to_out frozen → path dies). Keeps the path alive with live gradient "
+                        "without freezing the gate parameter (unlike clamp). Try 0.05 for small data where cross-attn tends to die. 0.0 = off (original).")
     g.add_argument("--no_prosody", action="store_true", help="Disable prosody conditioning")
+    g.add_argument("--no_prosody_direct", action="store_true",
+                   help="Disable ONLY the prosody direct path, keeping prosody cross-attention. "
+                        "Removes direct↔cross-attn competition on the same layers. "
+                        "Recommended with enough data (15h+) so cross-attn can carry prosody.")
+    g.add_argument("--no_prosody_cross_attn", action="store_true",
+                   help="Disable ONLY prosody cross-attention, keeping the direct path. "
+                        "Recommended for small datasets (<10h) where cross-attn would die.")
 
     g = p.add_argument_group("duration predictor")
     g.add_argument("--use_duration_predictor", action="store_true", help="Train prosody-conditioned duration predictor")
+    g.add_argument("--duration_speaker_dropout", type=float, default=0.0,
+                   help="Dropout on the speaker vector inside the duration predictor. "
+                        "Speaker is ~98%% of the predictor input, so it tends to memorise "
+                        "per-speaker rates and over-predict duration on unseen/cross-language "
+                        "speakers (→ padding/leakage). Try 0.3-0.5.")
+    g.add_argument("--duration_speaker_bottleneck", type=int, default=0,
+                   help="Compress the speaker vector to this width before the duration "
+                        "predictor (e.g. 32) to limit per-speaker memorisation. 0 = off.")
     g.add_argument("--dur_loss_weight", type=float, default=0.1, help="Weight for duration prediction loss")
 
     g = p.add_argument_group("checkpoints")
@@ -223,13 +268,19 @@ def build_model(args, vocab_size: int) -> EnhancedCFM:
         speaker_emb_dim=args.speaker_emb_dim,
         emotion_emb_dim=args.emotion_emb_dim,
         use_adaln_cond=not args.no_adaln,
+        adaln_bottleneck_dim=args.adaln_bottleneck_dim,
         use_input_add_cond=not args.no_input_add,
         use_cross_attn_cond=not args.no_cross_attn,
         speaker_raw_dim=SPEAKER_RAW_DIMS.get(args.speaker_backend, 512),
         emotion_raw_dim=EMOTION_RAW_DIMS.get(args.emotion_backend, 768),
         prosody_dim=args.prosody_dim,
         prosody_raw_dim=PROSODY_RAW_DIM if not args.no_prosody else None,
-        use_prosody_cross_attn=not args.no_prosody,
+        use_prosody_cross_attn=(not args.no_prosody) and (not args.no_prosody_cross_attn),
+        use_prosody_direct=(not args.no_prosody) and (not args.no_prosody_direct),
+        fusion_mode=args.fusion_mode,
+        cross_attn_gate_floor=args.cross_attn_gate_floor,
+        speaker_emb_dropout=args.speaker_emb_dropout,
+        speaker_emb_noise=args.speaker_emb_noise,
     )
 
     return EnhancedCFM(
@@ -239,6 +290,8 @@ def build_model(args, vocab_size: int) -> EnhancedCFM:
             n_mel_channels=N_MEL, target_sample_rate=TARGET_SR, mel_spec_type=MEL_TYPE,
         ),
         use_duration_predictor=getattr(args, "use_duration_predictor", False),
+        duration_speaker_dropout=getattr(args, "duration_speaker_dropout", 0.0),
+        duration_speaker_bottleneck=getattr(args, "duration_speaker_bottleneck", 0),
         speaker_emb_dim=args.speaker_emb_dim,
     )
 
@@ -275,23 +328,77 @@ def load_pretrained_weights(model: EnhancedCFM, ckpt_path: str):
 #  Freeze strategy
 # ══════════════════════════════════════════════════════════════════════
 
+def zero_future_stage_gates(model, stage: int):
+    """Zero the gates of gated-residual modules belonging to stages AFTER `stage`.
+
+    Must be re-applied after loading a resume checkpoint: apply_curriculum_stage
+    sets these gate values, but a subsequent load_state_dict(model_last.pt)
+    overwrites them with the checkpoint's values (which are the non-zero init
+    0.02/0.15 for never-trained future modules). Without re-zeroing, untrained
+    future modules would inject noise into the residual stream. requires_grad is
+    untouched (load_state_dict doesn't change it), so only values need fixing.
+    """
+    if stage <= 0:
+        return
+    agg = model.transformer.cond_aggregator
+
+    def _zero_gates_in(mod, value=0.0):
+        if mod is None:
+            return
+        items = list(mod.values()) if hasattr(mod, "values") else [mod]
+        for m in items:
+            if hasattr(m, "gate") and isinstance(m.gate, torch.nn.Parameter):
+                with torch.no_grad():
+                    m.gate.fill_(value)
+            elif isinstance(m, torch.nn.Module):
+                # Gate may live on nested submodules (e.g. EmoProsodyFusion holds
+                # two _FusionCrossAttn each with its own gate). Recurse to find
+                # every gate so the whole module is silenced.
+                for sub in m.modules():
+                    if sub is m:
+                        continue
+                    if hasattr(sub, "gate") and isinstance(sub.gate, torch.nn.Parameter):
+                        with torch.no_grad():
+                            sub.gate.fill_(value)
+
+    def _zero_param(name, value=0.0):
+        p = getattr(agg, name, None)
+        if p is not None and isinstance(p, torch.nn.Parameter):
+            with torch.no_grad():
+                p.fill_(value)
+
+    if stage < 2:
+        _zero_param("prosody_block_gates", 0.0)
+        _zero_param("prosody_global_gate", 0.0)
+    if stage < 3:
+        _zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.0)
+    if stage < 4:
+        _zero_gates_in(getattr(agg, "cross_attns", None), 0.0)
+    if stage < 5:
+        _zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.0)
+
+
 def apply_curriculum_stage(model, stage: int,
                            unfreeze_top_k: int = 0,
                            freeze_adaln: bool = False):
-    """Curriculum training: speaker → prosody → emotion → fusion → DiT → joint.
+    """Curriculum: speaker → prosody-direct → prosody-attn → emotion → fusion → joint.
 
     Each stage unfreezes NEW modules; previously trained modules stay active.
     Gates of untrained gated residuals are zeroed → no noise injection.
     AdaLN stays active on stages 2-5 (stabilises DiT); disable with --freeze_adaln.
 
-    Stage 1: Speaker     speaker_raw_proj + adaln_cond + input_add
-    Stage 2: Prosody     prosody_global_proj + prosody_direct_proj +
-                         prosody_temporal_smooth + prosody_raw_proj +
-                         prosody_cross_attns + duration_predictor
-    Stage 3: Emotion     emotion_raw_proj + frame_raw_proj + cross_attns
-    Stage 4: Fusion      emo_prosody_fusion
-    Stage 5: DiT blocks  top-K transformer blocks + norm_out + proj_out
-    Stage 6: All         all modules, use low LR (--lr_base_mult 0.1 etc.)
+    Stage 1: Speaker+Global  speaker_raw_proj + emotion_raw_proj + fusion +
+                             adaln_cond + input_add + duration_predictor
+    Stage 2: Prosody direct  prosody_direct_proj + prosody_temporal_smooth +
+                             prosody_global_proj + prosody gates
+    Stage 3: Prosody attn    prosody_cross_attns + prosody_raw_proj
+                             (prosody_direct stays active)
+    Stage 4: Emotion attn    frame_raw_proj + cross_attns
+    Stage 5: Fusion          emo_prosody_fusion
+    Stage 6: DiT blocks      top-K transformer blocks + norm_out + proj_out
+    Stage 0: (no curriculum — joint, use apply_freeze)
+
+    Recommended flow: 1 → 2 → 3 → 4 → 5 → (6) → 0 (joint finetune, low LR).
     """
     if stage == 0:
         return
@@ -307,14 +414,27 @@ def apply_curriculum_stage(model, stage: int,
             for p in mod.parameters():
                 p.requires_grad = True
 
-    def zero_gates_in(mod, value=0.0):
+    def _collect_gates(mod):
+        """All gate Parameters under `mod` — direct or on nested submodules
+        (EmoProsodyFusion keeps gates on its two _FusionCrossAttn children).
+        Handles ModuleDict (.values()), single modules, and recursion."""
         if mod is None:
-            return
+            return []
         items = list(mod.values()) if hasattr(mod, "values") else [mod]
+        gates = []
         for m in items:
             if hasattr(m, "gate") and isinstance(m.gate, torch.nn.Parameter):
-                with torch.no_grad():
-                    m.gate.fill_(value)
+                gates.append(m.gate)
+            elif isinstance(m, torch.nn.Module):
+                for sub in m.modules():
+                    if sub is not m and hasattr(sub, "gate") and isinstance(sub.gate, torch.nn.Parameter):
+                        gates.append(sub.gate)
+        return gates
+
+    def zero_gates_in(mod, value=0.0):
+        for g in _collect_gates(mod):
+            with torch.no_grad():
+                g.fill_(value)
 
     def zero_param(name, value=0.0):
         p = getattr(agg, name, None)
@@ -329,121 +449,96 @@ def apply_curriculum_stage(model, stage: int,
                 p.fill_(value)
             p.requires_grad = True
 
+    def gates_all_zero(mod):
+        gates = _collect_gates(mod)
+        if not gates:
+            return False
+        return all(g.detach().abs().max().item() < 1e-6 for g in gates)
+
     # ── Freeze everything ──────────────────────────────────────────────
     for p in model.parameters():
         p.requires_grad = False
 
-    # ── Zero gates of modules not yet trained ──────────────────────────
-    # Each stage zeroes only the gates of future stages (not current or past).
-    if stage < 2:
-        zero_param("prosody_block_gates", 0.0)
-        zero_param("prosody_global_gate", 0.0)
-        zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.0)
-    if stage < 3:
-        zero_gates_in(getattr(agg, "cross_attns", None), 0.0)
-    if stage < 4:
-        zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.0)
+    # ── Zero gates of modules not yet trained (future stages only) ─────
+    # Stage N zeroes gates belonging to stages > N so frozen-untrained
+    # modules inject no noise into the residual stream. (Shared with the
+    # resume path via zero_future_stage_gates so the two never drift.)
+    zero_future_stage_gates(model, stage)
 
-    # ── AdaLN: active on stages 1-5 by default ────────────────────────
-    # Provides stable scale/shift to DiT blocks.
-    # Frozen on stages 2-5 only if --freeze_adaln (after stage 1 converged).
-    adaln_active = (stage == 1) or (stage in (2, 3, 4, 5) and not freeze_adaln)
+    # ── AdaLN + input_add: active on stages 1-6 by default ─────────────
+    adaln_active = (stage == 1) or (stage in (2, 3, 4, 5, 6) and not freeze_adaln)
     if adaln_active:
         unfreeze(getattr(agg, "adaln_cond", None))
         unfreeze(getattr(agg, "input_add", None))
 
-    # ── fusion: always active on stages 1-5 ───────────────────────────
-    # fusion(speaker_emb, emotion_emb) → fused_global → adaln_cond / input_add
-    # Without fusion being trained, adaln_cond receives random noise on ALL stages.
-    if stage in (1, 2, 3, 4, 5):
+    # ── fusion + emotion_raw_proj: active stages 1-6 ───────────────────
+    # fusion(speaker_emb, emotion_emb) feeds adaln_cond/input_add.
+    # Both inputs (speaker_raw_proj, emotion_raw_proj) must be trained for
+    # fusion to receive clean signal — so emotion_raw_proj trains from stage 1.
+    if stage in (1, 2, 3, 4, 5, 6):
         unfreeze(getattr(agg, "fusion", None))
-        # emotion_raw_proj feeds fusion. If frozen with Kaiming init,
-        # emotion_emb is random → fused_global partially noisy.
-        # Unfreeze from stage 1 so fusion gets clean inputs from both sides.
         unfreeze(getattr(agg, "emotion_raw_proj", None))
 
-    # ── Stage-specific modules ─────────────────────────────────────────
-
+    # ── Stage 1: Speaker + global conditioning ─────────────────────────
     if stage >= 1:
-        # Speaker global identity
         unfreeze(getattr(agg, "speaker_raw_proj", None))
-        # Duration predictor is fundamental — train from stage 1
         if model.duration_predictor is not None:
             for p in model.duration_predictor.parameters():
                 p.requires_grad = True
 
+    # ── Stage 2: Prosody direct (coarse pitch/energy, no attention) ────
     if stage >= 2:
-        # Prosody — all three paths
-        unfreeze(getattr(agg, "prosody_global_proj", None))
         unfreeze(getattr(agg, "prosody_direct_proj", None))
         unfreeze(getattr(agg, "prosody_temporal_smooth", None))
-        unfreeze(getattr(agg, "prosody_raw_proj", None))
-        unfreeze(getattr(agg, "prosody_cross_attns", None))
-        # Restore prosody gates only if currently zero (first run of stage 2).
-        # If non-zero → resuming stage 2, keep learned values.
+        unfreeze(getattr(agg, "prosody_global_proj", None))
         if stage == 2:
             pg = getattr(agg, "prosody_block_gates", None)
             if pg is not None and pg.detach().abs().max().item() < 1e-6:
+                # First run: gates are still zeroed → restore to small init.
                 restore_gate("prosody_block_gates", 0.02)
                 restore_gate("prosody_global_gate", 0.02)
             else:
+                # Resuming stage 2 with already-trained gates: keep their learned
+                # per-block values as-is (do NOT collapse them to their mean,
+                # which would erase the per-block specialisation); just re-enable
+                # gradients.
                 for attr in ("prosody_block_gates", "prosody_global_gate"):
                     p = getattr(agg, attr, None)
                     if p is not None and isinstance(p, torch.nn.Parameter):
                         p.requires_grad = True
-            pca = getattr(agg, "prosody_cross_attns", None)
-            if pca is not None:
-                all_zero = all(
-                    abs(m.gate.detach().item()) < 1e-6
-                    for m in (pca.values() if hasattr(pca, "values") else [pca])
-                    if hasattr(m, "gate")
-                )
-                if all_zero:
-                    zero_gates_in(pca, 0.15)
         else:
-            # Stage 3+: prosody already trained, just unfreeze gates as-is
+            # Stage 3+: prosody direct already trained, keep gates as-is
             for attr in ("prosody_block_gates", "prosody_global_gate"):
                 p = getattr(agg, attr, None)
                 if p is not None and isinstance(p, torch.nn.Parameter):
                     p.requires_grad = True
-        # duration_predictor already unfrozen in stage >= 1 block
 
+    # ── Stage 3: Prosody cross-attention (fine frame-level pitch) ──────
     if stage >= 3:
-        # Emotion frame-level — cross_attns (global emotion_raw_proj already active above)
+        unfreeze(getattr(agg, "prosody_cross_attns", None))
+        unfreeze(getattr(agg, "prosody_raw_proj", None))
+        if stage == 3 and gates_all_zero(getattr(agg, "prosody_cross_attns", None)):
+            zero_gates_in(getattr(agg, "prosody_cross_attns", None), 0.15)
+
+    # ── Stage 4: Emotion cross-attention (intonation/affect) ───────────
+    if stage >= 4:
         unfreeze(getattr(agg, "frame_raw_proj", None))
         unfreeze(getattr(agg, "cross_attns", None))
-        # Restore cross_attn gates only if currently zero (first run of stage 3).
-        if stage == 3:
-            ca = getattr(agg, "cross_attns", None)
-            if ca is not None:
-                all_zero = all(
-                    abs(m.gate.detach().item()) < 1e-6
-                    for m in (ca.values() if hasattr(ca, "values") else [ca])
-                    if hasattr(m, "gate")
-                )
-                if all_zero:
-                    zero_gates_in(ca, 0.15)
+        if stage == 4 and gates_all_zero(getattr(agg, "cross_attns", None)):
+            zero_gates_in(getattr(agg, "cross_attns", None), 0.15)
 
-    if stage >= 4:
-        # Emo-prosody fusion — cross-modal attention between emotion and prosody
-        unfreeze(getattr(agg, "emo_prosody_fusion", None))
-        if stage == 4:
-            ef = getattr(agg, "emo_prosody_fusion", None)
-            if ef is not None:
-                all_zero = all(
-                    abs(m.gate.detach().item()) < 1e-6
-                    for m in (ef.values() if hasattr(ef, "values") else [ef])
-                    if hasattr(m, "gate")
-                )
-                if all_zero:
-                    zero_gates_in(ef, 0.15)
-
+    # ── Stage 5: Emotion↔Prosody fusion ────────────────────────────────
     if stage >= 5:
+        unfreeze(getattr(agg, "emo_prosody_fusion", None))
+        if stage == 5 and gates_all_zero(getattr(agg, "emo_prosody_fusion", None)):
+            zero_gates_in(getattr(agg, "emo_prosody_fusion", None), 0.15)
+
+    # ── Stage 6: DiT base blocks ───────────────────────────────────────
+    if stage >= 6:
         if unfreeze_top_k <= 0:
-            print(f"  ⚠ Stage 5 requires --unfreeze_top_k > 0 to unfreeze DiT blocks. "
+            print(f"  ⚠ Stage 6 requires --unfreeze_top_k > 0 to unfreeze DiT blocks. "
                   f"Currently no DiT blocks will be unfrozen.")
         else:
-            # DiT blocks — base model fine-tuning
             blocks = model.transformer.transformer_blocks
             for i in range(max(0, len(blocks) - unfreeze_top_k), len(blocks)):
                 for p in blocks[i].parameters():
@@ -453,28 +548,14 @@ def apply_curriculum_stage(model, stage: int,
             for p in model.transformer.proj_out.parameters():
                 p.requires_grad = True
 
-    if stage >= 6:
-        # All conditioning — joint fine-tuning (use low LR via build_param_groups)
-        for name in (
-            "speaker_raw_proj", "emotion_raw_proj", "frame_raw_proj",
-            "fusion", "adaln_cond", "input_add",
-            "prosody_direct_proj", "prosody_temporal_smooth",
-            "prosody_global_proj", "prosody_raw_proj",
-            "prosody_cross_attns", "cross_attns", "emo_prosody_fusion",
-        ):
-            unfreeze(getattr(agg, name, None))
-        for attr in ("prosody_block_gates", "prosody_global_gate"):
-            p = getattr(agg, attr, None)
-            if p is not None and isinstance(p, torch.nn.Parameter):
-                p.requires_grad = True
 
     stage_names = {
-        1: "Speaker     (speaker_raw_proj + adaln_cond + input_add)",
-        2: "Prosody     (prosody_global/direct/cross_attn + duration)",
-        3: "Emotion     (emotion_raw_proj + frame_raw_proj + cross_attns)",
-        4: "Fusion      (emo_prosody_fusion)",
-        5: f"DiT blocks  (top-{unfreeze_top_k} blocks + norm_out + proj_out)",
-        6: "All modules (joint fine-tune, use low LR)",
+        1: "Speaker+Global (speaker+emotion_raw_proj + fusion + adaln + input_add + duration)",
+        2: "Prosody direct (prosody_direct/global_proj + temporal_smooth + gates)",
+        3: "Prosody attn   (prosody_cross_attns + prosody_raw_proj)",
+        4: "Emotion attn   (frame_raw_proj + cross_attns)",
+        5: "Fusion         (emo_prosody_fusion)",
+        6: f"DiT blocks     (top-{unfreeze_top_k} blocks + norm_out + proj_out)",
     }
     total    = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -540,8 +621,14 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
     # Speaker/global conditioning group (stable identity signal)
     speaker_module_names = [
         "adaln_cond",       # fused_global → scale/shift in every DiT block
-        "fusion",           # speaker_emb + emotion_emb → fused_global
+        "fusion",           # concat-mode fusion (None in residual mode)
+        "fusion_speaker",   # residual-mode: speaker path (always reaches fused)
+        "fusion_emotion",   # residual-mode: emotion correction
+        "fusion_emotion_gate",
         "speaker_raw_proj", # raw WavLM-SV → speaker_emb (stable per utterance)
+        "emotion_raw_proj", # GLOBAL emotion → other input to shared fusion;
+                            # kept here (not emotion group) so both fusion inputs
+                            # train at the SAME lr → no speaker/emotion competition
         "input_add",        # fused_global → DiT input residual
     ]
     for name in speaker_module_names:
@@ -566,8 +653,14 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
     # emo_prosody_fusion: cross-modal emotion↔prosody frame fusion
     #   gradient: through cross_attns gate → weak
     #   → beta2=0.95
+    # emotion FRAME modules only — emotion_raw_proj (GLOBAL) is intentionally
+    # in the speaker group instead, because it is the other input to the shared
+    # `fusion` module. If emotion_raw_proj trains faster (cross_attn_mult=2x)
+    # than speaker_raw_proj/fusion (speaker_mult=1x), fusion adapts to the
+    # emotion half first and underuses the speaker half → voice stops cloning
+    # while emotion/prosody still respond. Keeping BOTH fusion inputs in the
+    # same group at the same LR prevents that competition.
     emotion_module_names = [
-        "emotion_raw_proj",   # global emotion projection (variable per utterance)
         "cross_attns",        # emotion frame cross-attention
         "emo_prosody_fusion", # emotion↔prosody cross-modal fusion
     ]
@@ -626,17 +719,26 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
         for p in model.duration_predictor.parameters():
             duration_ids.add(id(p))
 
-    # Unfrozen DiT blocks (top-K + norm_out + proj_out)
-    if args.freeze_base and args.unfreeze_top_k > 0:
-        blocks = model.transformer.transformer_blocks
-        for i in range(max(0, len(blocks) - args.unfreeze_top_k), len(blocks)):
-            for p in blocks[i].parameters():
-                if p.requires_grad:
-                    base_ids.add(id(p))
-        for mod in (model.transformer.norm_out, model.transformer.proj_out):
-            for p in mod.parameters():
-                if p.requires_grad:
-                    base_ids.add(id(p))
+    # Unfrozen DiT base params (pretrained) — collected by ACTUAL requires_grad,
+    # not gated on args.freeze_base. DiT blocks can be unfrozen by either path:
+    #   - apply_freeze(freeze_base=True, unfreeze_top_k>0), OR
+    #   - apply_curriculum_stage(stage=6, unfreeze_top_k>0), which does NOT set
+    #     freeze_base, OR
+    #   - joint stage 0 with freeze_base=False (all blocks trainable).
+    # Previously base_ids was filled only under `freeze_base and unfreeze_top_k>0`,
+    # so stage-6 / no-freeze runs left these trainable pretrained params out of
+    # every conditioning set → they fell through to the conditioning group and
+    # trained at full LR instead of the conservative lr*lr_base_mult, risking
+    # catastrophic damage to pretrained weights. Keying on requires_grad covers
+    # all unfreeze paths and is safe (DiT params never overlap conditioning sets).
+    for blk in model.transformer.transformer_blocks:
+        for p in blk.parameters():
+            if p.requires_grad:
+                base_ids.add(id(p))
+    for mod in (model.transformer.norm_out, model.transformer.proj_out):
+        for p in mod.parameters():
+            if p.requires_grad:
+                base_ids.add(id(p))
 
     # Build groups — each trainable param in exactly one group
     proj_params, cross_attn_params, emotion_params, speaker_params, prosody_params, cond_params, dur_params, base_params = [], [], [], [], [], [], [], []
@@ -1052,8 +1154,15 @@ def save_checkpoint(
     epoch: int,
     path: str,
     is_last: bool = False,
+    arch_config: dict | None = None,
 ):
-    """Save a resumable checkpoint (online model + EMA + optimizer + scheduler)."""
+    """Save a resumable checkpoint (online model + EMA + optimizer + scheduler).
+
+    arch_config: architecture flags (fusion_mode, adaln_bottleneck_dim,
+    use_prosody_direct/cross_attn, dims, ...) needed to REBUILD the model
+    identically at inference. Persisted so inference doesn't have to guess —
+    a mismatch silently drops conditioning weights → broken cloning.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     payload = {
@@ -1063,6 +1172,8 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
     }
+    if arch_config is not None:
+        payload["arch_config"] = arch_config
 
     if ema_model is not None:
         payload["ema_model_state_dict"] = ema_model.state_dict()
@@ -1193,7 +1304,20 @@ def main():
         apply_freeze(model, args.freeze_base, args.unfreeze_top_k)
 
     # 5. EMA (main process)
-    ema = EMA(model, include_online_model=False) if is_main else None
+    # decay controls how fast EMA tracks the online model.
+    # 0.9999 (default) suits large datasets / long training.
+    # For smaller datasets or staged curriculum (fewer steps per stage),
+    # a faster EMA (0.999) tracks rapidly-changing weights better.
+    ema = (
+        EMA(
+            model,
+            beta=args.ema_decay,
+            update_after_step=args.ema_update_after,
+            update_every=args.ema_update_every,
+            include_online_model=False,
+        )
+        if is_main else None
+    )
     if ema:
         ema.to(dev)
 
@@ -1215,8 +1339,19 @@ def main():
     spk_enc, emo_enc, prosody_enc = maybe_load_encoders(args, str(dev))
 
     # 9. Scheduler
-    warmup = args.num_warmup_updates * accelerator.num_processes
-    total = math.ceil(len(dataloader) / args.grad_accumulation_steps) * args.epochs
+    # IMPORTANT: scheduler.step() is called once per optimizer sync step, which
+    # happens PER RANK. So total/warmup must be in per-rank optimizer steps.
+    # At this point `dataloader` has NOT yet been through accelerator.prepare(),
+    # so len(dataloader) is the GLOBAL batch count (all ranks). Divide by
+    # num_processes to get the per-rank batch count, then by grad accumulation.
+    # (Previously: `total` used the global count → scheduler only traversed 1/N
+    #  of its schedule on N GPUs; `warmup` was multiplied by num_processes →
+    #  warmup phase was N× too long. Both are now in consistent per-rank units.)
+    nproc = max(accelerator.num_processes, 1)
+    per_rank_batches = math.ceil(len(dataloader) / nproc)
+    steps_per_epoch = math.ceil(per_rank_batches / args.grad_accumulation_steps)
+    total = steps_per_epoch * args.epochs
+    warmup = args.num_warmup_updates
     decay = max(total - warmup, 1)
 
     warmup_sched = LinearLR(
@@ -1235,7 +1370,7 @@ def main():
     # Per-group extended warmup for cross-attention
     # Cross-attn needs longer warmup: random K/V → model learns to close gate
     # immediately without warmup. With 3-5× warmup, gate stabilises before decaying.
-    cross_attn_warmup = args.num_warmup_updates_cross_attn * accelerator.num_processes
+    cross_attn_warmup = args.num_warmup_updates_cross_attn  # per-rank steps (no num_processes scaling)
     if cross_attn_warmup > warmup:
         if is_main:
             print(f"  Cross-attn extended warmup: {cross_attn_warmup} steps "
@@ -1294,6 +1429,13 @@ def main():
         model_sd = ckpt.get("model_state_dict")
         if model_sd is not None and len(model_sd) > 0:
             accelerator.unwrap_model(model).load_state_dict(model_sd, strict=False)
+            # load_state_dict just overwrote gate VALUES with the checkpoint's;
+            # for a staged run that re-introduces non-zero gates on not-yet-trained
+            # future modules (they init at 0.02/0.15). Re-zero them so untrained
+            # modules stay silent. requires_grad was set by apply_curriculum_stage
+            # and is unaffected by load_state_dict.
+            if args.train_stage > 0:
+                zero_future_stage_gates(accelerator.unwrap_model(model), args.train_stage)
             if is_main:
                 print(f"  Restored {len(model_sd)} model params")
         else:
@@ -1322,10 +1464,12 @@ def main():
             print(f"Resumed at step {step}, epoch {start_epoch}")
         del ckpt
 
-    # Pre-compute cross-attn decay_steps once (used in training loop per-step)
+    # Pre-compute cross-attn decay_steps once (used in training loop per-step).
+    # Reuse the per-rank `total` computed for the global scheduler so the two
+    # schedules share the same step basis (recomputing here risked divergence,
+    # and post-prepare len(dataloader) is per-rank just like `total`).
     if _cross_attn_init_lrs:
-        _total_steps = math.ceil(len(dataloader) / args.grad_accumulation_steps) * args.epochs
-        _cross_attn_decay_steps = max(_total_steps - cross_attn_warmup, 1)
+        _cross_attn_decay_steps = max(total - cross_attn_warmup, 1)
     else:
         _cross_attn_decay_steps = 0
 
@@ -1340,7 +1484,51 @@ def main():
 
     best_val_loss = float("inf")
     raw_model = accelerator.unwrap_model(model)  # unwrapped for checkpoint saving
-    
+
+    # Architecture flags persisted in every checkpoint so inference rebuilds the
+    # model identically (a mismatch silently drops conditioning weights → broken
+    # cloning). Read by load_enhanced_model via the checkpoint's "arch_config".
+    arch_config = {
+        "speaker_emb_dim": args.speaker_emb_dim,
+        "emotion_emb_dim": args.emotion_emb_dim,
+        "adaln_bottleneck_dim": args.adaln_bottleneck_dim,
+        "use_adaln_cond": not args.no_adaln,
+        "use_input_add_cond": not args.no_input_add,
+        "use_cross_attn_cond": not args.no_cross_attn,
+        "speaker_raw_dim": SPEAKER_RAW_DIMS.get(args.speaker_backend, 512),
+        "emotion_raw_dim": EMOTION_RAW_DIMS.get(args.emotion_backend, 768),
+        "prosody_dim": args.prosody_dim,
+        "prosody_raw_dim": PROSODY_RAW_DIM if not args.no_prosody else None,
+        "use_prosody_cross_attn": (not args.no_prosody) and (not args.no_prosody_cross_attn),
+        "use_prosody_direct": (not args.no_prosody) and (not args.no_prosody_direct),
+        "fusion_mode": args.fusion_mode,
+        "cross_attn_gate_floor": args.cross_attn_gate_floor,
+    }
+
+    def _crossattn_gate_report():
+        """Effective cross-attn strength per fusion layer = tanh(gate).
+        ~0 → that cross-attn is effectively disabled (model ignores it);
+        larger → it is actively contributing. Returns {name: mean_abs_tanh_gate}."""
+        agg = getattr(raw_model.transformer, "cond_aggregator", None)
+        if agg is None:
+            return {}
+        report = {}
+        for attr, label in (("cross_attns", "emo_xattn"), ("prosody_cross_attns", "pros_xattn")):
+            md = getattr(agg, attr, None)
+            if md is None:
+                continue
+            vals = []
+            for mod in md.values():
+                # a fusion module may hold its own gate and/or sub-gates;
+                # modules() yields the module itself plus all descendants.
+                for sub in mod.modules():
+                    g = getattr(sub, "gate", None)
+                    if isinstance(g, torch.nn.Parameter):
+                        vals.append(torch.tanh(g.detach()).abs().mean().item())
+            if vals:
+                report[label] = sum(vals) / len(vals)
+        return report
+
     mode_loss_sum = defaultdict(float)
     mode_count = defaultdict(int)
     
@@ -1373,14 +1561,14 @@ def main():
                     if condition_lifecycle is not None else None
                 )
 
-                loss, _, _, mode_names, dur_loss = model(
+                loss, _, _, mode_names, dur_loss, per_sample_loss = model(
                     inp=mel, text=text, lens=lens,
                     conditions=conditions,
                     # Duration predictor inputs
                     prosody_raw=batch.get("prosody_raw"),
                     prosody_mask=batch.get("prosody_mask"),
                     text_byte_lens=torch.tensor(
-                        [len(t.encode("utf-8")) for t in batch["text"]],
+                        [len(t) for t in batch["text"]],  # CHARS not bytes: byte counts skew across scripts (Cyrillic=2B/char) → cross-language duration bias
                         dtype=torch.long,
                     ) if getattr(raw_model, "duration_predictor", None) is not None else None,
                     speaker_emb_for_dur=batch.get("speaker_raw"),
@@ -1388,14 +1576,29 @@ def main():
 
                 # Combined loss (dur_loss is 0.0 when predictor disabled — free to add)
                 total_loss = loss + args.dur_loss_weight * dur_loss
-                
-                
-                # ── NaN/Inf guard: skip corrupted batches ──
-                if not torch.isfinite(total_loss):
+
+
+                # ── NaN/Inf guard: skip corrupted batches (DDP-safe) ──
+                # The skip decision MUST be identical on every rank. If one rank
+                # saw NaN and bailed out via `continue` (skipping backward) while
+                # others called accelerator.backward(), the others would initiate
+                # the gradient all-reduce and block forever waiting for the rank
+                # that left — a hard DDP deadlock. So we reduce a local NaN flag
+                # across all ranks (max = logical OR): if ANY rank has NaN, ALL
+                # ranks skip together; otherwise ALL proceed to backward. Same
+                # logic makes the consecutive-NaN epoch-break fire in lockstep.
+                local_bad = torch.tensor(
+                    [0.0 if torch.isfinite(total_loss) else 1.0], device=dev
+                )
+                if accelerator.num_processes > 1:
+                    local_bad = accelerator.reduce(local_bad, reduction="max")
+                batch_is_bad = bool(local_bad.item() > 0)
+
+                if batch_is_bad:
                     optimizer.zero_grad()
                     nan_consecutive += 1
                     if is_main:
-                        tqdm.write(f"  ⚠ step ~{step}: NaN/Inf loss, skipping batch "
+                        tqdm.write(f"  ⚠ step ~{step}: NaN/Inf loss on ≥1 rank, skipping batch "
                                    f"({nan_consecutive} consecutive)")
                     if nan_consecutive >= 5:
                         if is_main:
@@ -1404,13 +1607,17 @@ def main():
                         break
                     continue
                 
-                # Per-mode loss tracking: distribute batch loss across all modes present.
-                # This is approximate (batch loss ≠ per-sample loss), but avoids
-                # the previous bug of attributing the entire loss to the most common mode.
-                loss_val = float(loss.detach().item())
-                for m in mode_names:
-                    mode_loss_sum[m] += loss_val
-                    mode_count[m] += 1
+                # Per-mode loss tracking: EXACT per-sample attribution.
+                # per_sample_loss[i] is the masked-frame mean for sample i, and
+                # mode_names[i] is that sample's dropout mode — so each mode gets
+                # only the loss of its own samples (no batch-mean smearing).
+                # NaN entries = samples with no masked frames → skipped.
+                psl = per_sample_loss.detach()
+                for i, m in enumerate(mode_names):
+                    li = psl[i].item()
+                    if li == li:  # not NaN
+                        mode_loss_sum[m] += li
+                        mode_count[m] += 1
                 
                 nan_consecutive = 0
                 accelerator.backward(total_loss)
@@ -1446,22 +1653,46 @@ def main():
                 if is_main and ema:
                     ema.update()
                 step += 1
-                epoch_loss += loss.item()
+                # Track the value actually being minimized (flow + weighted dur),
+                # not the bare flow loss — otherwise the epoch average and the
+                # progress bar disagree with the optimization target whenever the
+                # duration predictor is active.
+                total_loss_val = total_loss.item()
+                flow_loss_val = loss.item()
+                epoch_loss += total_loss_val
                 epoch_steps += 1
-                pbar.set_postfix(loss=f"{loss.item():.4f}",
-                                 avg=f"{epoch_loss/epoch_steps:.4f}",
-                                 lr=f"{scheduler.get_last_lr()[0]:.2e}", s=step)
-                
+                _has_dur = getattr(raw_model, "duration_predictor", None) is not None
+                postfix = dict(loss=f"{total_loss_val:.4f}",
+                               avg=f"{epoch_loss/epoch_steps:.4f}",
+                               lr=f"{scheduler.get_last_lr()[0]:.2e}", s=step)
+                if _has_dur:
+                    # Surface the components so it's clear what drives total.
+                    postfix["flow"] = f"{flow_loss_val:.4f}"
+                    postfix["dur"] = f"{float(dur_loss.item()) if torch.is_tensor(dur_loss) else float(dur_loss):.4f}"
+                pbar.set_postfix(**postfix)
+
                 if is_main and args.logger:
-                    accelerator.log({"train/loss": loss.item(),
-                                     "train/lr": scheduler.get_last_lr()[0]}, step=step)
+                    log_d = {"train/loss": total_loss_val,
+                             "train/flow_loss": flow_loss_val,
+                             "train/lr": scheduler.get_last_lr()[0]}
+                    if _has_dur:
+                        log_d["train/dur_loss"] = (
+                            float(dur_loss.item()) if torch.is_tensor(dur_loss) else float(dur_loss)
+                        )
+                    accelerator.log(log_d, step=step)
 
                 if args.logger == "tensorboard" and accelerator.is_main_process:
-                    writer.add_scalar("train_loss", loss.item(), step)
+                    writer.add_scalar("train_loss", total_loss_val, step)
+                    writer.add_scalar("train/flow_loss", flow_loss_val, step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
+                    if _has_dur:
+                        writer.add_scalar("train/dur_loss",
+                                          float(dur_loss.item()) if torch.is_tensor(dur_loss) else float(dur_loss),
+                                          step)
                 
                 if step % 100 == 0 and any(mode_count.values()):
-                
+
+                    _cond_report = {}
                     for m in ("full", "uncond", "voice_only", "no_emotion", "no_prosody", "no_speaker", "textless"):
                         ls = torch.tensor(mode_loss_sum.get(m, 0.0), device=accelerator.device, dtype=torch.float32)
                         ct = torch.tensor(mode_count.get(m, 0), device=accelerator.device, dtype=torch.float32)
@@ -1470,25 +1701,59 @@ def main():
                         ct = accelerator.reduce(ct, reduction="sum")
 
                         if is_main and ct.item() > 0:
-                            accelerator.log({f"train/loss_{m}": (ls / ct).item()}, step=step)
-                        
+                            mval = (ls / ct).item()
+                            _cond_report[m] = mval
+                            accelerator.log({f"train/loss_{m}": mval}, step=step)
+
                             if args.logger == "tensorboard":
-                                writer.add_scalar(f"train/loss_{m}", (ls / ct).item(), step)
-                    
+                                writer.add_scalar(f"train/loss_{m}", mval, step)
+
+                    # Console summary: per-condition loss + contribution of each
+                    # signal = (loss without it) - (full). Positive = the model
+                    # relies on that condition (removing it hurts). Near-zero for
+                    # a signal means it is NOT being used — useful to diagnose
+                    # e.g. weak speaker conditioning (poor voice cloning).
+                    if is_main and _cond_report:
+                        full = _cond_report.get("full")
+                        parts = [f"{m}={v:.4f}" for m, v in _cond_report.items()]
+                        line = "  [cond] " + "  ".join(parts)
+                        if full is not None:
+                            contrib = []
+                            for m, label in (("no_speaker", "spk"), ("no_prosody", "pros"),
+                                             ("no_emotion", "emo"), ("uncond", "all")):
+                                if m in _cond_report:
+                                    contrib.append(f"{label}+{_cond_report[m]-full:.4f}")
+                            if contrib:
+                                line += "  | contrib(↑=used): " + " ".join(contrib)
+                        tqdm.write(line)
+
                     mode_loss_sum.clear()
                     mode_count.clear()
+
+                    # Cross-attention diagnostic: effective gate strength per
+                    # fusion type. Near-zero → cross-attn effectively off.
+                    if is_main:
+                        gates = _crossattn_gate_report()
+                        if gates:
+                            gline = "  [xattn] " + "  ".join(f"{k}={v:.4f}" for k, v in gates.items())
+                            tqdm.write(gline)
+                            if args.logger:
+                                accelerator.log({f"train/gate_{k}": v for k, v in gates.items()}, step=step)
+                            if args.logger == "tensorboard":
+                                for k, v in gates.items():
+                                    writer.add_scalar(f"train/gate_{k}", v, step)
                 
             if step % args.last_per_updates == 0 and accelerator.sync_gradients:
                 accelerator.wait_for_everyone()
                 if is_main:
                     save_checkpoint(raw_model, ema, optimizer, scheduler, step, epoch,
-                                    os.path.join(args.checkpoint_dir, "model_last.pt"))
+                                    os.path.join(args.checkpoint_dir, "model_last.pt"), arch_config=arch_config)
 
             if step % args.save_per_updates == 0 and accelerator.sync_gradients:
                 accelerator.wait_for_everyone()
                 if is_main:
                     save_checkpoint(raw_model, ema, optimizer, scheduler, step, epoch,
-                                    os.path.join(args.checkpoint_dir, f"model_{step}.pt"))
+                                    os.path.join(args.checkpoint_dir, f"model_{step}.pt"), arch_config=arch_config)
                     clean_old_checkpoints(args.checkpoint_dir, args.keep_last_n_checkpoints)
 
             # ── Validation ──
@@ -1513,7 +1778,7 @@ def main():
                     if improved:
                         best_val_loss = val_loss
                         save_checkpoint(raw_model, ema, optimizer, scheduler, step, epoch,
-                                        os.path.join(args.checkpoint_dir, "model_best.pt"))
+                                        os.path.join(args.checkpoint_dir, "model_best.pt"), arch_config=arch_config)
 
         # ── End-of-epoch validation ──
         if val_loader is not None:
@@ -1533,7 +1798,7 @@ def main():
                 if improved:
                     best_val_loss = val_loss
                     save_checkpoint(raw_model, ema, optimizer, scheduler, step, epoch,
-                                    os.path.join(args.checkpoint_dir, "model_best.pt"))
+                                    os.path.join(args.checkpoint_dir, "model_best.pt"), arch_config=arch_config)
         elif is_main:
             print(f"  Epoch {epoch+1} done — avg loss: {epoch_loss/max(epoch_steps,1):.4f}")
 
@@ -1541,7 +1806,7 @@ def main():
     accelerator.wait_for_everyone()
     if is_main:
         save_checkpoint(raw_model, ema, optimizer, scheduler, step, args.epochs,
-                        os.path.join(args.checkpoint_dir, "model_last.pt"))
+                        os.path.join(args.checkpoint_dir, "model_last.pt"), arch_config=arch_config)
         print(f"\nDone! {step} updates → {args.checkpoint_dir}/model_last.pt")
         if val_loader is not None and best_val_loss < float("inf"):
             print(f"Best val loss: {best_val_loss:.5f} → {args.checkpoint_dir}/model_best.pt")

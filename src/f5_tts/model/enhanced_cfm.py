@@ -453,7 +453,7 @@ class EnhancedCFM(nn.Module):
             chunks = out.chunk(n, dim=0)
             if use_expression_cfg:
                 f, u, v = chunks[0], chunks[1], chunks[2]
-                result = f + cfg_strength * (v - u)
+                result = f + cfg_strength * (f - u)
                 if n == 4:
                     e = chunks[3]
                     if use_emo_cfg:
@@ -506,7 +506,7 @@ class EnhancedCFM(nn.Module):
                 # Base guidance: speaker/text/audio relative to full uncond.
                 # Carries NO expression signal, so emotion/prosody are not
                 # amplified here and stay independent of cfg_strength.
-                result = f + cfg_strength * (v - u)
+                result = f + cfg_strength * (f - u)
 
                 if use_emo_cfg or use_pros_cfg:
                     e = self.transformer(

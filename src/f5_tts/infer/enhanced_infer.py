@@ -97,35 +97,16 @@ def load_prosody_encoder(
     output_dim: int = 256,
     device_str: str = device,
     rmvpe_model_path: str | None = None,
-    prosody_stats_path: str | None = None,
 ) -> ProsodyEncoder:
-    """Load prosody encoder for F0/energy extraction.
-
-    prosody_stats_path: path to the prosody_stats.json written by prepare_data.
-    These fixed normalization stats MUST match the ones used during
-    preprocessing/training, otherwise the prosody conditioning signal differs
-    between train and inference. If None or missing, the encoder's speech
-    defaults are used (correct only if training also used the defaults).
-    """
+    """Load prosody encoder for F0/energy extraction."""
     print(f"Loading prosody encoder ({backend})...")
-    stat_kwargs = {}
-    if prosody_stats_path is not None and os.path.exists(prosody_stats_path):
-        import json as _json
-        with open(prosody_stats_path) as f:
-            st = _json.load(f)
-        if st.get("f0_norm_mean") is not None:
-            stat_kwargs = dict(
-                f0_norm_mean=st["f0_norm_mean"], f0_norm_std=st["f0_norm_std"],
-                energy_norm_mean=st["energy_norm_mean"], energy_norm_std=st["energy_norm_std"],
-            )
-            print(f"  Using corpus prosody stats from {prosody_stats_path}")
-    else:
-        if prosody_stats_path is not None:
-            print(f"  ⚠ prosody_stats not found at {prosody_stats_path}; using defaults "
-                  f"(must match training, or prosody conditioning will be miscalibrated)")
+    import os as _os
+    # MUST match the mode used to build the training cache (F0_NORM_MODE), or the
+    # prosody features at inference differ from training → degraded prosody.
+    _f0_mode = _os.environ.get("F0_NORM_MODE", "legacy")
     return ProsodyEncoder(
         backend=backend, output_dim=output_dim, device=device_str,
-        rmvpe_model_path=rmvpe_model_path, **stat_kwargs,
+        rmvpe_model_path=rmvpe_model_path, f0_norm_mode=_f0_mode,
     ).to(device_str).eval()
 
 
@@ -161,7 +142,12 @@ def load_enhanced_model(
         from safetensors.torch import load_file
         checkpoint = load_file(ckpt_path, device="cpu")
     else:
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        # weights_only=False explicitly: a training checkpoint may carry non-tensor
+        # payload (arch_flags dict, optimizer/scheduler state). The torch default for
+        # weights_only changed across PyTorch versions (True on 2.6+), which would
+        # reject such checkpoints version-dependently. Be explicit so loading behaves
+        # the same everywhere and stays consistent with the resume path.
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     def _pick_state_dict(ckpt):
         if isinstance(ckpt, dict):
@@ -192,6 +178,45 @@ def load_enhanced_model(
     has_prosody = any("prosody" in k for k in state_for_shapes)
     # Detect whether checkpoint has duration predictor
     has_dur_pred = any("duration_predictor" in k for k in state_for_shapes)
+    # Detect emotion bottleneck from weight shapes. Legacy: emotion_raw_proj is a
+    # single Linear → key "...emotion_raw_proj.weight". Bottleneck: it's a Sequential
+    # (Linear(768,B), SiLU, Linear(B,dim)) → keys "...emotion_raw_proj.0.weight" etc.
+    # The bottleneck width B = first Linear's out_features. This is a weight-shape
+    # change, so it MUST be reconstructed or the state dict won't load.
+    # Detect fusion_mode from weights: residual builds fusion_speaker.* (+ fusion_emotion
+    # + gate); concat builds a single fusion.*. Weight-based detection is more robust
+    # than arch_flags (works for checkpoints saved before arch_flags existed).
+    fusion_mode_detected = None
+    if any(".fusion_speaker." in k for k in state_for_shapes):
+        fusion_mode_detected = "residual"
+    elif any(k.rstrip("0123456789.").endswith("cond_aggregator.fusion") for k in state_for_shapes) \
+            or any(".fusion.0.weight" in k for k in state_for_shapes):
+        fusion_mode_detected = "concat"
+
+    emotion_bottleneck_dim = 0
+    for k, v in state_for_shapes.items():
+        if k.endswith("emotion_raw_proj.0.weight"):
+            emotion_bottleneck_dim = v.shape[0]  # out_features of the narrow layer
+            break
+    # Detect AdaLN bottleneck width from block_projs.0.0.weight = [bottleneck, dim].
+    # Trained with --adaln_bottleneck_dim N → first projection's out_features = N.
+    # Default DiT is 256; if the checkpoint used 512 it MUST be reconstructed or the
+    # state dict won't load (this is the most common inference shape mismatch).
+    adaln_bottleneck_dim = 256
+    for k, v in state_for_shapes.items():
+        if k.endswith("adaln_cond.block_projs.0.0.weight"):
+            adaln_bottleneck_dim = v.shape[0]
+            break
+    # Detect whether the trained duration predictor used speaker input, from the
+    # first Linear's in_features. prosody_global(7)+log_text_len(1) = 8 without
+    # speaker; +speaker_dim with it. Reconstruct the matching architecture so the
+    # weights load (otherwise shape mismatch).
+    dur_use_speaker = True
+    for k, v in state_for_shapes.items():
+        if k.endswith("duration_predictor.net.0.weight"):
+            in_features = v.shape[1]
+            dur_use_speaker = in_features > 8 + 1  # >9 → speaker dim included
+            break
 
     # --- Build model config ---
     if model_cfg is None:
@@ -200,41 +225,79 @@ def load_enhanced_model(
             text_mask_padding=False, conv_layers=4, pe_attn_head=1,
             attn_backend="torch", attn_mask_enabled=False,
         )
-    else:
-        # Copy: the .update() below would otherwise mutate the caller's dict
-        # in place, leaking speaker/emotion/prosody dims into it and corrupting
-        # a second load_enhanced_model() call that reuses the same dict.
-        model_cfg = dict(model_cfg)
 
     model_cfg.update(
         speaker_emb_dim=speaker_emb_dim, emotion_emb_dim=emotion_emb_dim,
         speaker_raw_dim=speaker_raw_dim, emotion_raw_dim=emotion_raw_dim,
         prosody_dim=prosody_dim, prosody_raw_dim=prosody_raw_dim,
-        use_prosody_cross_attn=has_prosody,
+        # Variant A: prosody cross-attn presence is detected from checkpoint keys
+        # (prosody_cross_attns.* absent → trained without it → keep off here).
+        use_prosody_cross_attn=has_prosody and any(
+            "prosody_cross_attns" in k for k in state_for_shapes),
+        # Emotion cross-attn presence detected from cond_aggregator.cross_attns.* keys.
+        # Use a prefix that does NOT also match "prosody_cross_attns" (which ends in
+        # the same substring). Absent → lightweight model without emotion cross-attn.
+        use_cross_attn_cond=any(
+            k.split("cond_aggregator.")[-1].startswith("cross_attns.")
+            for k in state_for_shapes if "cond_aggregator." in k),
+        # input_add presence detected from input_add.proj.* keys. Absent → trained
+        # with --no_input_add → don't build it (otherwise 4 missing params). Note:
+        # input_add is normally CRITICAL for cloning; if it's missing the model was
+        # trained without it, and inference must match that to load.
+        use_input_add_cond=any(
+            ".input_add." in k for k in state_for_shapes),
+        emotion_bottleneck_dim=emotion_bottleneck_dim,
+        adaln_bottleneck_dim=adaln_bottleneck_dim,
+        # emotion_direct presence is detectable from its projection weights
+        # (emotion_direct_proj.*). Reconstruct so the weights load.
+        use_emotion_direct=any("emotion_direct_proj" in k for k in state_for_shapes),
+        # Variant C: AdaLN speaker-only is detected from absence of prosody_global
+        # enrichment under a speaker-only trained checkpoint. The flag is structural
+        # (no extra weights), so it must be set to match training; detect via the
+        # presence of prosody_global_proj being unused is unreliable, so honor the
+        # explicit model_cfg override if the caller passed one.
+        # adaln_speaker_only is a STRUCTURAL flag (no weight-shape change), so it
+        # can't be detected from the state dict. Read it from arch_flags saved at
+        # training time; fall back to explicit model_cfg override, then False.
+        adaln_speaker_only=(
+            checkpoint.get("arch_flags", {}).get("adaln_speaker_only")
+            if isinstance(checkpoint, dict) and checkpoint.get("arch_flags")
+            else model_cfg.get("adaln_speaker_only", False)
+        ),
+        # prosody_in_adaln is structural too (decides whether prosody_global enriches
+        # AdaLN under speaker_only). Changes which params train, not weight SHAPES, so
+        # it must come from arch_flags to match training at inference.
+        prosody_in_adaln=(
+            checkpoint.get("arch_flags", {}).get("prosody_in_adaln", False)
+            if isinstance(checkpoint, dict) and checkpoint.get("arch_flags")
+            else model_cfg.get("prosody_in_adaln", False)
+        ),
+        # use_timbre_encoder ADDS weights (the TimbreEncoder + timbre_proj/gate), so it
+        # must match training or state-dict loading fails. Read from arch_flags; the
+        # presence of timbre weights in the checkpoint is the ground truth, but
+        # arch_flags is the explicit record saved at train time.
+        use_timbre_encoder=(
+            checkpoint.get("arch_flags", {}).get("use_timbre_encoder", False)
+            if isinstance(checkpoint, dict) and checkpoint.get("arch_flags")
+            else model_cfg.get("use_timbre_encoder", False)
+        ),
+        # normalize_speaker is also structural (just an F.normalize, no weight change)
+        # → must come from arch_flags, same as adaln_speaker_only.
+        normalize_speaker=(
+            checkpoint.get("arch_flags", {}).get("normalize_speaker", False)
+            if isinstance(checkpoint, dict) and checkpoint.get("arch_flags")
+            else model_cfg.get("normalize_speaker", False)
+        ),
+        # fusion_mode changes weight structure (residual builds fusion_speaker +
+        # fusion_emotion + gate; concat builds a single fusion). Prefer weight-based
+        # detection; fall back to arch_flags, then model_cfg, then concat.
+        fusion_mode=(
+            fusion_mode_detected
+            or (checkpoint.get("arch_flags", {}).get("fusion_mode")
+                if isinstance(checkpoint, dict) and checkpoint.get("arch_flags") else None)
+            or model_cfg.get("fusion_mode", "concat")
+        ),
     )
-
-    # If the checkpoint persisted its architecture (fusion_mode, bottleneck,
-    # prosody paths, dims), apply it so the model is rebuilt IDENTICALLY to
-    # training. Without this, a model trained with non-default architecture
-    # (e.g. fusion_mode="residual" or adaln_bottleneck_dim=512) would be rebuilt
-    # with defaults → conditioning weights silently dropped → broken cloning.
-    # Explicit kwargs above still win only for the dims we already inferred.
-    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("arch_config"), dict):
-        ac = checkpoint["arch_config"]
-        for k in ("fusion_mode", "adaln_bottleneck_dim", "use_adaln_cond",
-                  "use_input_add_cond", "use_cross_attn_cond",
-                  "use_prosody_cross_attn", "use_prosody_direct", "cross_attn_gate_floor",
-                  "speaker_emb_dim", "emotion_emb_dim", "prosody_dim"):
-            if k in ac and ac[k] is not None:
-                model_cfg[k] = ac[k]
-        # raw dims: prefer checkpoint arch_config, fall back to inferred
-        for k in ("speaker_raw_dim", "emotion_raw_dim", "prosody_raw_dim"):
-            if ac.get(k) is not None:
-                model_cfg[k] = ac[k]
-        print(f"  Loaded architecture from checkpoint: fusion_mode={ac.get('fusion_mode')}, "
-              f"bottleneck={ac.get('adaln_bottleneck_dim')}, "
-              f"prosody_direct={ac.get('use_prosody_direct')}, "
-              f"prosody_xattn={ac.get('use_prosody_cross_attn')}")
 
     model = EnhancedCFM(
         transformer=EnhancedDiT(
@@ -248,6 +311,7 @@ def load_enhanced_model(
         odeint_kwargs=dict(method=ode_method),
         vocab_char_map=vocab_char_map,
         use_duration_predictor=has_dur_pred,
+        duration_use_speaker=dur_use_speaker,
         speaker_emb_dim=speaker_emb_dim,
     ).to(device_str)
 
@@ -267,41 +331,18 @@ def load_enhanced_model(
         f"Missing: {len(missing)} | "
         f"Unexpected: {len(unexpected)}"
     )
-
-    # strict=False is intentional (EMA wrappers, optional prosody/duration heads),
-    # but it can silently drop or skip conditioning weights, which then run with
-    # random-initialized values and produce garbage audio with NO error. The most
-    # common cause is a raw-projection dim that _infer_in_features failed to detect
-    # (slightly different key name): the projection module is then not built, the
-    # checkpoint's projection weights land in `unexpected`, and project_*() returns
-    # the un-projected raw embedding. Surface that explicitly.
-    _critical = (
-        "speaker_raw_proj", "emotion_raw_proj", "frame_raw_proj", "prosody_raw_proj",
-        "cross_attns", "prosody_cross_attns", "adaln_cond", "input_add",
-    )
-
-    def _hits(names, keys):
-        return sorted({n for n in names for k in keys if n in k})
-
-    # Conditioning weights present in the checkpoint but dropped (module not built).
-    dropped = _hits(_critical, unexpected)
-    # Conditioning weights the model expects but the checkpoint did not provide
-    # (left random-initialized).
-    uninit = _hits(_critical, missing)
-    if dropped:
-        print(
-            "  ⚠ WARNING: conditioning/projection weights in the checkpoint were "
-            f"DROPPED as unexpected: {dropped}. The corresponding modules were not "
-            "built — likely a raw-projection input dim was not detected. These signals "
-            "will be UN-projected/ignored at inference. Pass the correct *_raw_dim "
-            "explicitly to load_enhanced_model()."
-        )
-    if uninit:
-        print(
-            "  ⚠ WARNING: conditioning/projection modules are present in the model but "
-            f"MISSING from the checkpoint (random-initialized): {uninit}. Inference "
-            "output for these signals will be garbage."
-        )
+    # Print the actual names so architecture mismatches are diagnosable. Missing =
+    # in the model but not the checkpoint (model built a module the ckpt lacks).
+    # Unexpected = in the checkpoint but not the model (ckpt has a module the
+    # inference model didn't build — usually a flag not auto-detected/reconstructed).
+    if missing:
+        print("  ── Missing (model has, checkpoint lacks) ──")
+        for k in missing:
+            print(f"     {k}")
+    if unexpected:
+        print("  ── Unexpected (checkpoint has, model lacks) ──")
+        for k in unexpected:
+            print(f"     {k}")
 
     del checkpoint
     if "cuda" in device_str:
@@ -319,61 +360,58 @@ def extract_reference_embeddings(
     emotion_encoder: EmotionEncoder,
     device_str: str = device,
     prosody_encoder: ProsodyEncoder | None = None,
-    use_emotion_frame: bool = True,   # set False to NOT feed emotion FRAME cross-attn
-                                      # (emotion2vec frames carry phonetics → leak
-                                      # reference content for out-of-distribution,
-                                      # e.g. cross-language, references). Global
-                                      # emotion is kept (phonetics averaged out).
-    use_emotion: bool = True,         # False → drop emotion entirely (global+frame)
-    use_prosody: bool = True,         # False → drop prosody conditioning
+    ablate_speaker: bool = False,
 ) -> RawConditionBatch:
     """Extract raw speaker + emotion + prosody embeddings from any-language reference.
 
     Returns RAW (un-projected) embeddings — the ConditioningAggregator inside
     the model handles projection from raw→target dim for consistency with
     the training pipeline.
-
-    For out-of-distribution references (different language from training), the
-    emotion FRAME path is the main content-leak vector: emotion2vec frame
-    embeddings encode phonetics, and the position-agnostic cross-attention can
-    reorder/copy them into the output (heard as reference leakage and sentence
-    reordering). use_emotion_frame=False keeps speaker + global emotion +
-    prosody while removing that vector.
     """
     audio, sr = torchaudio.load(ref_audio_path)
     if audio.shape[0] > 1:
         audio = audio.mean(dim=0, keepdim=True)
     audio = audio.to(device_str)
 
-    # Speaker embedding for a single, un-padded reference. This is the
-    # "per_sample" regime (no padding, no attention_mask). It matches a training
-    # cache built with SPEAKER_EMB_MODE=per_sample (and the original REA
-    # pipeline). If the cache was built with SPEAKER_EMB_MODE=masked (batched +
-    # attention_mask), the training and inference embeddings come from slightly
-    # different WavLM-SV regimes → a distribution shift that can weaken cloning.
-    # Rule of thumb: build the cache with per_sample to match this path exactly.
-    spk_raw = speaker_encoder.extract_raw(audio, sr=sr)
-    if use_emotion and hasattr(emotion_encoder, "extract_raw_with_mask"):
+    # Pass explicit true length so the speaker (and emotion) encoders take the
+    # SAME masked-pooling path as prepare_data caching. For a single unpadded file
+    # this equals the full length, but passing it makes the train/inference path
+    # identical instead of relying on "single file ⇒ no padding ⇒ probably same",
+    # which would break the moment ref audio is ever batched.
+    spk_lengths = torch.tensor([audio.shape[-1]], device=device_str, dtype=torch.long)
+    spk_raw = speaker_encoder.extract_raw(audio, sr=sr, lengths=spk_lengths)
+    if hasattr(emotion_encoder, "extract_raw_with_mask"):
         emo_global_raw, emo_frame_raw, emo_frame_mask = emotion_encoder.extract_raw_with_mask(audio, sr=sr)
-    elif use_emotion:
+    else:
         emo_global_raw, emo_frame_raw = emotion_encoder.extract_raw(audio, sr=sr)
         emo_frame_mask = (
             torch.ones(emo_frame_raw.shape[:2], dtype=torch.bool, device=emo_frame_raw.device)
             if emo_frame_raw is not None else None
         )
-    else:
-        emo_global_raw = emo_frame_raw = emo_frame_mask = None
-
-    # Drop only the FRAME path (keep global emotion as a phonetics-free summary).
-    if not use_emotion_frame:
-        emo_frame_raw = None
-        emo_frame_mask = None
 
     # Prosody extraction (F0 + energy + voicing)
     prosody_raw = None
     prosody_mask = None
-    if prosody_encoder is not None and use_prosody:
+    if prosody_encoder is not None:
         prosody_raw, prosody_mask = prosody_encoder.extract_raw(audio, sr=sr)
+
+    # Match the training cache's fp16 quantization. prepare_data's save_worker stores
+    # speaker/emotion/prosody raw embeddings as float16 to save disk, so during
+    # training the projections see fp16-rounded inputs. At inference these come fresh
+    # in float32, a slightly different (finer) input distribution than the projection
+    # heads were trained on. Round-tripping through fp16 here makes the inference
+    # input distribution identical to training. The effect is small, but it removes
+    # one more train/inference mismatch.
+    def _match_cache_fp16(t):
+        return t.half().float() if isinstance(t, torch.Tensor) and t.is_floating_point() else t
+    # Only emotion_* are fp16 in the cache now, so only they are fp16-rounded here to
+    # match training. speaker_raw and prosody_raw are cached in fp32 (see prepare_data),
+    # so they must stay full fp32 at inference — rounding them would re-introduce the
+    # train/inference mismatch this matching is meant to remove.
+    emo_global_raw = _match_cache_fp16(emo_global_raw)
+    emo_frame_raw = _match_cache_fp16(emo_frame_raw)
+    # spk_raw: NOT fp16-rounded — cached fp32 (carries the pitch-level signal).
+    # prosody_raw: NOT fp16-rounded — cached fp32 (channel 5 = log_f0_absolute).
 
     return RawConditionBatch(
         speaker_raw=spk_raw,
@@ -381,7 +419,14 @@ def extract_reference_embeddings(
         emotion_frame_raw=emo_frame_raw,
         prosody_raw=prosody_raw,
         speaker_present=(
-            torch.ones(spk_raw.shape[0], dtype=torch.bool, device=spk_raw.device)
+            # ablate_speaker=True marks the speaker as ABSENT (present=False), which
+            # routes through the same multiply-mask the model saw for voice-dropped
+            # samples in training → a clean "no speaker" generation for the ablation
+            # test (does the speaker path actually affect the output?). Normal path
+            # uses ones (speaker present).
+            torch.zeros(spk_raw.shape[0], dtype=torch.bool, device=spk_raw.device)
+            if (spk_raw is not None and ablate_speaker)
+            else torch.ones(spk_raw.shape[0], dtype=torch.bool, device=spk_raw.device)
             if spk_raw is not None else None
         ),
         emotion_global_present=(
@@ -411,46 +456,20 @@ def infer_enhanced(
     sway_sampling_coef: float = -1.0,
     speed: float = 1.0,
     fix_duration: float | None = None,
+    duration_mode: str = "auto",  # "auto" (predictor if present) | "heuristic" (ref-rate scaling)
     seed: int | None = None,
     target_rms: float = 0.1,
     show_info=print,
     device_str: str = device,
-    use_emotion_frame: bool = True,   # False recommended for cross-language refs
-    use_emotion: bool = True,
-    use_prosody: bool = True,
-    no_ref_audio: bool = False,       # DIAGNOSTIC/clean-speaker mode: zero out the
-                                      # reference MEL prefix. F5-TTS does in-context
-                                      # continuation from the ref mel; with an
-                                      # out-of-distribution (e.g. cross-language)
-                                      # reference the model continues that foreign
-                                      # acoustic context → leakage that is NOT fixed
-                                      # by dropping emotion/prosody. With no_ref_audio
-                                      # the voice comes only from the speaker
-                                      # embedding path (weaker cloning, but no mel
-                                      # in-context leak). If leakage vanishes here,
-                                      # the ref-mel prefix is the cause.
-    ignore_ref_text: bool = False,    # DIAGNOSTIC: drop ref_text from the text
-                                      # prefix (use only gen_text). F5-TTS feeds
-                                      # text as [ref_text + gen_text]; an
-                                      # out-of-distribution ref_text (foreign
-                                      # language) biases the model to synthesize
-                                      # foreign acoustics even when the mel prefix
-                                      # is zeroed. NOTE: F5-TTS is trained WITH a
-                                      # ref_text prefix, so removing it is
-                                      # off-distribution and may reduce quality —
-                                      # this is primarily to localize the leak.
-                                      # When set, duration ignores the ref/gen text
-                                      # ratio (uses fix_duration or a gen-only
-                                      # estimate) to avoid the divide-by-tiny blowup.
-    trim_leading_silence: bool = False,  # strip leading near-silence the model
-                                         # may emit by continuing the reference's
-                                         # trailing silence (keeps a 20ms lead-in).
-    duration_scale: float = 1.0,         # multiply the duration-predictor output
-                                         # (use <1, e.g. 0.85, if it runs long and
-                                         # you hear padded/leaked tails). Ignored
-                                         # when fix_duration is set.
+    ablate_speaker: bool = False,
 ) -> tuple[np.ndarray, int]:
-    """Full enhanced inference: reference audio → generated speech."""
+    """Full enhanced inference: reference audio → generated speech.
+
+    ablate_speaker=True marks the speaker as absent (speaker_present=False) so the
+    speaker path contributes nothing — used to test whether speaker conditioning is
+    trained: compare output with vs without it. If the two sound the same, the
+    speaker path is being ignored (under-trained).
+    """
     ref_audio_processed, ref_text_processed = preprocess_ref_audio_text(
         ref_audio, ref_text, show_info=show_info,
     )
@@ -459,9 +478,7 @@ def infer_enhanced(
     embs = extract_reference_embeddings(
         ref_audio_processed, speaker_encoder, emotion_encoder, device_str,
         prosody_encoder=prosody_encoder,
-        use_emotion_frame=use_emotion_frame,
-        use_emotion=use_emotion,
-        use_prosody=use_prosody,
+        ablate_speaker=ablate_speaker,
     )
 
     audio, sr = torchaudio.load(ref_audio_processed)
@@ -477,89 +494,56 @@ def infer_enhanced(
 
     # Chunk text
     audio_dur = max(audio.shape[-1] / target_sample_rate, 0.1)
-    # Chars, not UTF-8 bytes — byte counts skew across scripts (Cyrillic=2B/char),
-    # inflating max_chars for Latin gen_text after a Cyrillic reference.
-    ref_chars = max(len(ref_text_processed), 1)
-    max_chars = int(ref_chars / audio_dur * max(22 - audio_dur, 1) * speed)
+    ref_bytes = max(len(ref_text_processed.encode("utf-8")), 1)
+    max_chars = int(ref_bytes / audio_dur * max(22 - audio_dur, 1) * speed)
     gen_text_batches = chunk_text(gen_text, max_chars=max_chars)
 
     show_info(f"Generating {len(gen_text_batches)} chunk(s), emo_cfg={emotion_cfg_strength}, pros_cfg={prosody_cfg_strength}")
 
     waves = []
     for batch_text in gen_text_batches:
-        local_speed = 0.3 if len(batch_text) < 10 else speed  # chars not bytes: script-neutral short-text threshold
-        eff_ref_text = "" if ignore_ref_text else ref_text_processed
-        text_list = [eff_ref_text + batch_text]
+        local_speed = 0.3 if len(batch_text.encode("utf-8")) < 10 else speed
+        text_list = [ref_text_processed + batch_text]
         final_text = convert_char_to_pinyin(text_list)
 
         ref_len = audio.shape[-1] // hop_length
+        _heuristic = (duration_mode == "heuristic")
         if fix_duration is not None:
             # fix_duration is the desired GENERATED speech length (seconds).
             # The reference prefix occupies ref_len frames and is trimmed off the
             # output afterwards, so it must be ADDED on top — otherwise the trim
             # eats most of fix_duration (e.g. fix_duration=4s with a 3s reference
-            # left only ~1s of speech). When the ref prefix is dropped entirely
-            # (no_ref_audio+ignore_ref_text) nothing is trimmed, so add nothing.
+            # would leave only ~1s of actual generated speech). This matches the
+            # duration_predictor branch below (ref_len + gen frames).
             gen_frames = int(fix_duration * target_sample_rate / hop_length)
-            duration = (0 if (ignore_ref_text and no_ref_audio) else ref_len) + gen_frames
-        elif getattr(model, "duration_predictor", None) is not None and embs.prosody_raw is not None:
-            # Trained duration predictor, conditioned on REFERENCE prosody. Its
-            # rate (frames/char) is derived from the reference clip, so pauses or
-            # slow/trailing speech in the reference inflate the rate → an
-            # over-long duration. F5-TTS fills the whole duration, so the excess
-            # is padded/filled with reference-like content → audible leakage.
-            # Two guards:
-            #   • duration_scale: global multiplier to correct systematic bias
-            #     (e.g. 0.85 if the predictor consistently runs ~15% long).
-            #   • a hard CAP from a plain chars→frames estimate, so the predicted
-            #     length can never exceed what the text could plausibly need.
-            gen_text_chars = len(batch_text)  # chars, not bytes — must match training units
+            duration = ref_len + gen_frames
+        elif (not _heuristic
+              and getattr(model, "duration_predictor", None) is not None
+              and embs.prosody_raw is not None):
+            # Use trained duration predictor conditioned on reference prosody
+            gen_text_bytes = len(batch_text.encode("utf-8"))
             spk_emb = embs.speaker_raw  # (1, speaker_dim) raw speaker embedding
-            pred_gen = model.duration_predictor.predict_duration(
+            duration = model.duration_predictor.predict_duration(
                 prosody_raw=embs.prosody_raw,
                 prosody_mask=embs.prosody_mask,
-                text_byte_len=gen_text_chars,  # param name is historical; unit is CHARS now
+                text_byte_len=gen_text_bytes,
                 speaker_emb=spk_emb,
             )
-            pred_gen = int(pred_gen * duration_scale)
-            # Upper cap: nominal speaking rate ~14 chars/sec → frames/char ≈
-            # (target_sample_rate/hop)/14. Allow generous headroom (×1.5) so we
-            # only clip pathological over-predictions, not natural variation.
-            fps = target_sample_rate / hop_length
-            cap = int(gen_text_chars * (fps / 14.0) * 1.5 / max(local_speed, 1e-3))
-            pred_gen = min(pred_gen, cap)
-            duration = ref_len + pred_gen  # predictor returns gen frames, add ref prefix
-        elif ignore_ref_text:
-            # No ref_text in the prefix → there is no text↔mel reference pair to
-            # continue from. Estimate generation length from gen_text alone.
-            gen_text_len = len(batch_text)
-            FRAMES_PER_CHAR = 8  # ~ conservative; tune via fix_duration for precision
-            gen_frames = int(gen_text_len * FRAMES_PER_CHAR / local_speed)
-            # When the mel prefix is ALSO dropped (no_ref_audio), there is no
-            # reference region at all → do NOT reserve/trim ref_len, otherwise the
-            # first ref_len frames of REAL generated speech get cut (heard as the
-            # first sentence disappearing). Keep ref_len only if the mel prefix is
-            # still present.
-            duration = (ref_len if not no_ref_audio else 0) + gen_frames
+            duration = ref_len + duration  # predictor returns gen frames, add ref prefix
         else:
-            # Fallback: linear formula.
-            # Count Unicode CHARS, not UTF-8 bytes: byte counts skew the ratio
-            # across scripts (Cyrillic=2 bytes/char, Latin=1), so a Russian
-            # reference + English gen_text would halve the estimated duration
-            # (sped-up/truncated speech) and vice versa. Character count is a
-            # script-neutral proxy for spoken length.
-            ref_text_len = max(len(ref_text_processed), 1)
-            gen_text_len = len(batch_text)
+            # Heuristic (level 0a): scale the reference's OWN measured rate
+            # (ref_len / ref_text_len) by the generated text length. Uses the real
+            # tempo of THIS reference → no learned weights, no per-speaker
+            # memorisation, no over-prediction. This is also the default fallback
+            # when no predictor is trained. local_speed > 1 speeds up, < 1 slows.
+            ref_text_len = max(len(ref_text_processed.encode("utf-8")), 1)
+            gen_text_len = len(batch_text.encode("utf-8"))
             duration = ref_len + int(ref_len / ref_text_len * gen_text_len / local_speed)
 
         with torch.inference_mode():
-            # Effective reference-prefix length. When BOTH text and mel prefixes
-            # are removed there is no reference region: cond_mask must be empty and
-            # the output must NOT be trimmed (else real generated speech is cut).
-            eff_ref_len = 0 if (ignore_ref_text and no_ref_audio) else ref_len
             model_conditions = None
             if getattr(model, "condition_lifecycle", None) is not None:
-                lens = torch.tensor([eff_ref_len], device=device_str, dtype=torch.long)
+                lens = torch.tensor([ref_len], device=device_str, dtype=torch.long)
                 text_ids = model._to_text_ids(final_text, 1, device_str)
                 duration_t = torch.tensor([duration], device=device_str, dtype=torch.long)
                 target_len = int(torch.maximum(torch.maximum((text_ids != -1).sum(dim=-1), lens) + 1, duration_t).clamp(max=65536).amax().item())
@@ -573,11 +557,8 @@ def infer_enhanced(
                 conditions=model_conditions,
                 emotion_cfg_strength=emotion_cfg_strength,
                 prosody_cfg_strength=prosody_cfg_strength,
-                no_ref_audio=no_ref_audio,
-                lens=(torch.tensor([eff_ref_len], device=device_str, dtype=torch.long)
-                      if eff_ref_len != ref_len else None),
             )
-            gen = gen.to(torch.float32)[:, eff_ref_len:, :].permute(0, 2, 1)
+            gen = gen.to(torch.float32)[:, ref_len:, :].permute(0, 2, 1)
 
             if mel_spec_type == "vocos":
                 wave = vocoder.decode(gen)
@@ -586,22 +567,7 @@ def infer_enhanced(
 
             if rms < target_rms:
                 wave = wave * rms / target_rms
-            w = wave.squeeze().cpu().numpy()
-
-            # Optional: strip leading near-silence. The model often continues the
-            # reference's trailing silence, so generated speech can begin with a
-            # short zero/quiet pad. trim_leading_silence removes samples before the
-            # first frame whose amplitude exceeds a small threshold, leaving a tiny
-            # lead-in so onsets aren't clipped.
-            if trim_leading_silence:
-                import numpy as _np
-                amp = _np.abs(w)
-                thr = max(float(amp.max()) * 0.02, 1e-4)  # 2% of peak
-                above = _np.where(amp > thr)[0]
-                if len(above) > 0:
-                    keep = max(above[0] - int(0.02 * target_sample_rate), 0)  # 20ms lead-in
-                    w = w[keep:]
-            waves.append(w)
+            waves.append(wave.squeeze().cpu().numpy())
 
     return crossfade_waves(waves, target_sample_rate, cross_fade_duration), target_sample_rate
 

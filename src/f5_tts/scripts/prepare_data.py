@@ -206,7 +206,7 @@ def _load_csv_metadata(path: str) -> list[dict]:
                 "audio_path": parts[0].strip(),
                 "text": parts[1].strip(),
                     }
-            entry["speaker"] = parts[2].strip()
+                entry["speaker"] = parts[2].strip()
             entry["language"] = 'ru'
 
             entries.append(entry)

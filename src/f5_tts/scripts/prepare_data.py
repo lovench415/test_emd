@@ -64,36 +64,23 @@ def validate_audio(audio_path: str, min_duration: float = 0.3, max_duration: flo
     """
     try:
         info = TinyTag.get(audio_path)
-        header_duration = info.duration
-
-        # Cheap pre-filter on the header to skip decoding files that are clearly
-        # out of range. The header value is NOT used downstream (it can disagree
-        # with the real decoded length for VBR / malformed-header files).
-        if header_duration is not None and (
-            header_duration < min_duration * 0.5 or header_duration > max_duration * 1.5
-        ):
+        duration = info.duration
+        
+        if duration < min_duration or duration > max_duration:
             return None
-
+        
         # Quick load to check for corruption
         audio, sr = torchaudio.load(audio_path)
-
+        
         # Check for NaN/Inf
         if torch.isnan(audio).any() or torch.isinf(audio).any():
             return None
-
-        # True duration from the decoded audio — this is what feeds get_frame_len
-        # and the dynamic batcher, so it must match the actual mel frame count.
-        # (Using the header value here would let header/actual drift make a batch
-        # over- or under-fill frames_threshold.)
-        duration = audio.shape[-1] / sr
-        if duration < min_duration or duration > max_duration:
-            return None
-
+        
         # Check for silence (RMS threshold)
         rms = torch.sqrt(torch.mean(audio ** 2))
         if rms < 1e-5:
             return None
-
+        
         return {
             "audio_path": os.path.abspath(audio_path),
             "duration": duration,
@@ -206,31 +193,22 @@ def prepare_metadata(
 
 
 def _load_csv_metadata(path: str) -> list[dict]:
-    """Load pipe-separated metadata: audio_path|text[|language[|speaker]]
-
-    Fields after `text` are optional. Missing language/speaker fall back to
-    defaults applied downstream (language='unknown', speaker='default').
-    """
+    """Load pipe-separated metadata: audio_path|text|language[|speaker]"""
     entries = []
     with open(path, "r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
+        for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) < 2 or not parts[0]:
-                # Need at least a path and a (possibly empty) transcript field.
-                # Empty text is allowed: single_speaker_finetune writes
-                # "path||lang" for untranscribed audio (F5-TTS can train without
-                # reference text). Only skip lines missing the path or the
-                # text field entirely.
-                print(f"  [SKIP] {path}:{lineno}: expected 'audio_path|text[|language[|speaker]]'")
-                continue
-            entry = {"audio_path": parts[0], "text": parts[1]}
-            if len(parts) >= 3 and parts[2]:
-                entry["language"] = parts[2]
-            if len(parts) >= 4 and parts[3]:
-                entry["speaker"] = parts[3]
+            parts = line.split("|")
+            if len(parts) >= 2:
+                entry = {
+                "audio_path": parts[0].strip(),
+                "text": parts[1].strip(),
+                    }
+            entry["speaker"] = parts[2].strip()
+            entry["language"] = 'ru'
+
             entries.append(entry)
     return entries
 
@@ -270,10 +248,9 @@ def extract_and_cache_embeddings(
     speaker_dim: int = 512,
     emotion_dim: int = 512,
     prosody_backend: str = "dio",
-    batch_size: int = 32,
+    batch_size: int = 1,
     device: str = "cuda",
     resume: bool = True,
-    amp_dtype: str = "fp16",
 ):
     """
     Stage 2: Extract speaker, emotion, and prosody embeddings for all samples.
@@ -324,69 +301,13 @@ def extract_and_cache_embeddings(
     ).to(device).eval()
 
     print(f"Loading prosody encoder: {prosody_backend}...")
+    import os as _os
+    _f0_mode = _os.environ.get("F0_NORM_MODE", "legacy")
     prosody_enc = ProsodyEncoder(
         backend=prosody_backend,
+        f0_norm_mode=_f0_mode,
         device=device,
     )
-
-    # ── Estimate corpus-wide prosody normalization stats ──
-    # The encoder normalizes log_f0/log_energy with FIXED stats so that
-    # reference clips and full utterances normalize identically (fix A). Those
-    # stats must reflect THIS corpus and must be reused verbatim at inference,
-    # otherwise the normalization — and thus the conditioning signal — differs
-    # between train and inference. We measure them once here on a subsample and
-    # persist to prosody_stats.json (loaded by inference). If a stats file
-    # already exists (resume), reuse it instead of recomputing.
-    stats_path = os.path.join(output_dir, "prosody_stats.json")
-    prosody_stats = None
-    if resume and os.path.exists(stats_path):
-        with open(stats_path) as f:
-            prosody_stats = json.load(f)
-        print(f"Reusing prosody stats from {stats_path}")
-    else:
-        n_stat = min(len(dataset), 2000)  # subsample is plenty for mean/std
-        stat_idxs = list(range(len(dataset)))
-        if len(stat_idxs) > n_stat:
-            import random as _r
-            _r.Random(0).shuffle(stat_idxs)
-            stat_idxs = stat_idxs[:n_stat]
-        acc = ProsodyEncoder.empty_log_stats()
-        used = 0
-        for si in tqdm(stat_idxs, desc="Estimating prosody stats"):
-            try:
-                row = dataset[si]
-                audio, sr = torchaudio.load(row["audio_path"])
-                if audio.shape[0] > 1:
-                    audio = torch.mean(audio, dim=0, keepdim=True)
-                audio_np = audio.squeeze(0).float().numpy()
-                lf0, le = prosody_enc.raw_logf0_energy(audio_np, sr)
-                if lf0.size > 0 and le.size > 0:
-                    ProsodyEncoder.update_log_stats(acc, lf0, le)
-                    used += 1
-            except Exception:
-                continue
-        prosody_stats = ProsodyEncoder.finalize_log_stats(acc)
-        prosody_stats["samples_used"] = used
-        if prosody_stats["f0_norm_mean"] is None or prosody_stats["energy_norm_mean"] is None:
-            print("  ⚠ Could not estimate prosody stats (no voiced frames?); using defaults")
-            prosody_stats = None
-        else:
-            with open(stats_path, "w") as f:
-                json.dump(prosody_stats, f, indent=2)
-            print(f"  Prosody stats ({used} samples): "
-                  f"f0 μ={prosody_stats['f0_norm_mean']:.3f} σ={prosody_stats['f0_norm_std']:.3f}, "
-                  f"energy μ={prosody_stats['energy_norm_mean']:.3f} σ={prosody_stats['energy_norm_std']:.3f}")
-            print(f"  Saved to {stats_path} (load these at inference)")
-
-    if prosody_stats is not None:
-        prosody_enc = ProsodyEncoder(
-            backend=prosody_backend,
-            device=device,
-            f0_norm_mean=prosody_stats["f0_norm_mean"],
-            f0_norm_std=prosody_stats["f0_norm_std"],
-            energy_norm_mean=prosody_stats["energy_norm_mean"],
-            energy_norm_std=prosody_stats["energy_norm_std"],
-        )
     
     # ── Determine which samples to process ──
     indices = []
@@ -407,24 +328,10 @@ def extract_and_cache_embeddings(
     # Prosody (pyworld) is CPU-bound → runs in parallel via ThreadPool.
     # Audio loading is I/O-bound → prefetched in background.
     
-    BATCH_SIZE = max(1, int(batch_size))  # configurable via --batch_size
+    BATCH_SIZE = 8  # 4× larger — GPU handles batches well
     prosody_on_gpu = prosody_backend in ("rmvpe", "crepe")
     success = 0
     failed = 0
-
-    # ── Mixed-precision inference for GPU encoders (#4) ──
-    # WavLM / Wav2Vec2 / HuBERT run correctly in fp16/bf16 at inference and gain
-    # ~1.5-2x throughput + halved VRAM (lets you raise --batch_size). No effect
-    # on cached output: raw embeddings are cast to fp16 on disk anyway, and the
-    # trainable projection heads run later in their own precision.
-    _amp_enabled = device.startswith("cuda") and amp_dtype in ("fp16", "bf16")
-    _amp_dtype = torch.bfloat16 if amp_dtype == "bf16" else torch.float16
-
-    def _autocast():
-        if _amp_enabled:
-            return torch.autocast(device_type="cuda", dtype=_amp_dtype)
-        from contextlib import nullcontext
-        return nullcontext()
 
     from concurrent.futures import ThreadPoolExecutor
     import queue
@@ -447,38 +354,6 @@ def extract_and_cache_embeddings(
             return p_raw.squeeze(0).cpu(), p_mask.squeeze(0).cpu()
         except Exception:
             return None, None
-
-    def extract_prosody_batch_rmvpe(batch):
-        """Batched RMVPE prosody (#2): one network forward over the padded batch.
-
-        The encoder batches the RMVPE conv/GRU stack internally; here we just
-        pad the (resampled) audio to equal length and hand the whole (B, T)
-        tensor over. Per-sample results are sliced back to their valid frame
-        count via the returned mask so padding doesn't leak into features.
-        """
-        try:
-            sr0 = batch[0][2]
-            mono = []
-            for _, a, sr in batch:
-                x = a
-                if x.dim() == 2:
-                    x = x.mean(dim=0) if x.shape[0] > 1 else x.squeeze(0)
-                mono.append(x)
-            max_t = max(x.shape[-1] for x in mono)
-            real_lengths = [int(x.shape[-1]) for x in mono]
-            padded = torch.zeros(len(mono), max_t)
-            for j, x in enumerate(mono):
-                padded[j, :x.shape[-1]] = x
-            p_raw, p_mask = prosody_enc.extract_raw(padded, sr=sr0, lengths=real_lengths)  # (B, T, P), (B, T)
-            out = []
-            for j in range(len(batch)):
-                valid = int(p_mask[j].sum().item())
-                valid = max(1, valid)
-                out.append((p_raw[j, :valid].cpu(), p_mask[j, :valid].cpu()))
-            return out
-        except Exception:
-            # Fall back to per-sample on any failure (mixed SR, OOM, etc.)
-            return [extract_prosody_cpu(a, sr) for _, a, sr in batch]
 
     # Prefetch audio in background (4 batches ahead)
     prefetch_q = queue.Queue(maxsize=BATCH_SIZE * 4)
@@ -503,9 +378,22 @@ def extract_and_cache_embeddings(
                 break
             out_path, save_dict = item
             try:
+                # fp16 to save disk, BUT keep prosody_raw AND speaker_raw in fp32.
+                # Prosody carries channel 5 = log_f0_absolute (values ~4.4–6.0), where
+                # fp16's fixed significant-digit budget gives a coarser ULP than on the
+                # normalized channels (~4.5× larger absolute error). That channel feeds
+                # the per-frame prosody_direct path and the global-stats / duration
+                # signals, so we avoid quantizing it.
+                # speaker_raw is kept fp32 too: it's the WavLM-SV embedding that carries
+                # the speaker identity AND (empirically) the absolute pitch level
+                # (linear-probe R²≈0.71), which AdaLN/fusion use to set the target's
+                # register. fp16 would quantize that level signal; keeping it fp32
+                # preserves it. Both tensors are small, so cache size is barely affected.
+                # emotion_* stay fp16 (learned embedding, ~3 sig-digits is fine there).
+                _FP32_KEYS = {"prosody_raw", "speaker_raw"}
                 save_dict_f16 = {
                     k: (v.half() if isinstance(v, torch.Tensor)
-                        and v.dtype == torch.float32 else v)
+                        and v.dtype == torch.float32 and k not in _FP32_KEYS else v)
                     for k, v in save_dict.items()
                 }
                 torch.save(save_dict_f16, out_path)
@@ -521,18 +409,6 @@ def extract_and_cache_embeddings(
     batch_data = []  # [(idx, audio, sr), ...]
     pbar = tqdm(total=len(indices), desc="Extracting embeddings")
 
-    # Cache resamplers per source sample rate (created once, reused across batches)
-    _resampler_cache = {}
-
-    def get_resampler(sr_orig):
-        if sr_orig == 16000:
-            return None
-        if sr_orig not in _resampler_cache:
-            _resampler_cache[sr_orig] = torchaudio.transforms.Resample(sr_orig, 16000).to(device)
-        return _resampler_cache[sr_orig]
-
-    _batch_count = [0]  # mutable counter for periodic cache clearing
-
     def flush_batch(batch):
         """Process a batch: GPU encoders batched, prosody overlaps with GPU."""
         nonlocal success, failed
@@ -542,51 +418,36 @@ def extract_and_cache_embeddings(
         # Sort by audio length — minimises padding waste for emotion batching
         batch = sorted(batch, key=lambda x: x[1].shape[-1])
 
-        # 1. Resample each audio to 16kHz by ITS OWN source rate.
-        #    Batch may contain mixed sample rates — using batch[0]'s rate for
-        #    all would mis-resample others. Track original 16k lengths too,
-        #    so emotion frames can be sliced back (avoid padding contamination).
+        # 1. Resample all audio to 16kHz once — speaker/emotion encoders use 16kHz
+        #    Avoids repeated resampling inside each encoder call
+        sr_orig = batch[0][2]
+        if sr_orig != 16000:
+            resampler = torchaudio.transforms.Resample(sr_orig, 16000).to(device)
+        else:
+            resampler = None
+
         audios_16k = []
-        lengths_16k = []
-        for _, audio, sr in batch:
+        for _, audio, _ in batch:
             a = audio.to(device)
-            resampler = get_resampler(sr)
             if resampler is not None:
                 a = resampler(a)
             audios_16k.append(a)
-            lengths_16k.append(a.shape[-1])
 
-        max_len_16k = max(lengths_16k)
+        max_len_16k = max(a.shape[-1] for a in audios_16k)
+        # True (un-padded) lengths at 16kHz — passed to speaker/emotion encoders so
+        # they mask out padding when pooling. Without this, WavLM-SV and emotion2vec
+        # average over the padding zeros, blurring the speaker embedding and
+        # contaminating emotion frames, AND mismatch inference (single un-padded file).
+        lengths_16k = [a.shape[-1] for a in audios_16k]
         padded_16k = torch.zeros(len(batch), 1, max_len_16k, device=device)
         for j, a in enumerate(audios_16k):
             padded_16k[j, :, :a.shape[-1]] = a
+        lengths_tensor = torch.tensor(lengths_16k, device=device, dtype=torch.long)
 
-        # 2. Batched speaker extraction.
-        #    SPEAKER_EMB_MODE controls how the training speaker embedding is built,
-        #    so it can be made IDENTICAL to the inference path (cloning depends on
-        #    train/inference consistency):
-        #      "masked" (default): batched + attention_mask (padding excluded via
-        #          the mask). Fast. Matches inference ONLY if inference also masks.
-        #      "per_sample": each clip encoded alone on its trimmed audio (no
-        #          padding at all). Slower but byte-for-byte the same regime as a
-        #          single-file inference and as the original REA pipeline.
-        #    Pick the SAME mode you will use at inference (extract_reference_
-        #    embeddings(speaker_mode=...)).
-        import os as _os
-        _spk_mode = _os.environ.get("SPEAKER_EMB_MODE", "masked")
+        # 2. Batched speaker extraction (lengths mask out padding in pooling)
         with torch.no_grad():
-            lengths_tensor = torch.tensor(lengths_16k, device=device, dtype=torch.long)
             try:
-                with _autocast():
-                    if _spk_mode == "per_sample":
-                        spk_list = []
-                        for a in audios_16k:
-                            s = speaker_enc.extract_raw(a, sr=16000)
-                            spk_list.append(s.squeeze(0))
-                        spk_raws = torch.stack(spk_list)
-                    else:
-                        spk_raws = speaker_enc.extract_raw(padded_16k, sr=16000, lengths=lengths_tensor)
-                spk_raws = spk_raws.float()
+                spk_raws = speaker_enc.extract_raw(padded_16k, sr=16000, lengths=lengths_tensor)
             except Exception:
                 spk_raws = []
                 for a in audios_16k:
@@ -594,32 +455,23 @@ def extract_and_cache_embeddings(
                         s = speaker_enc.extract_raw(a, sr=16000)
                         spk_raws.append(s.squeeze(0))
                     except Exception:
-                        spk_raws.append(None)  # SS: failed → None (present=False), not zeros
-                spk_raws = [r.cpu() if torch.is_tensor(r) else None for r in spk_raws]
-            # Single host transfer (#3): move the whole batch to CPU once instead
-            # of one .cpu() per sample in the save loop (each is a GPU sync).
-            if torch.is_tensor(spk_raws):
-                spk_raws = spk_raws.cpu()
+                        spk_raws.append(torch.zeros(speaker_enc.raw_dim, device=device))
+                spk_raws = torch.stack(spk_raws)
 
         # 3. Emotion: pass full padded batch at once
         #    _extract_hf handles (B, T) natively via feature_extractor(padding=True)
-        #    and returns an exact frame_mask (accounts for conv downsampling).
-        #    Use the mask to slice each sample's frames to its true valid count —
-        #    exact, unlike a length-ratio approximation. global_feat is already
-        #    padding-masked inside the encoder, so it needs no slicing.
+        #    _extract_funasr loops internally but avoids Python dispatch overhead
         emo_globals, emo_frames = [], []
         with torch.no_grad():
             try:
-                # Reuse lengths_tensor (defined above) — padded_16k is equal-length,
-                # so the feature extractor's own mask would be all-ones (contaminating
-                # global mean + frames with padding). Explicit lengths fix this.
-                with _autocast():
-                    eg_batch, ef_batch, mask_batch = emotion_enc.extract_raw_with_mask(
-                        padded_16k, sr=16000, lengths=lengths_tensor
-                    )
-                eg_batch = eg_batch.float()
-                if ef_batch is not None:
-                    ef_batch = ef_batch.float()
+                # Pass lengths: padded_16k is equal-length, so the feature
+                # extractor's own mask would be all-ones (contaminating global mean
+                # + frames with padding). Explicit lengths fix this. The returned
+                # frame_mask gives each sample's true valid frame count (accounts
+                # for conv downsampling) → exact slicing, no length-ratio guess.
+                eg_batch, ef_batch, mask_batch = emotion_enc.extract_raw_with_mask(
+                    padded_16k, sr=16000, lengths=lengths_tensor
+                )
                 for j in range(len(batch)):
                     emo_globals.append(eg_batch[j].cpu())
                     if ef_batch is not None:
@@ -637,29 +489,21 @@ def extract_and_cache_embeddings(
                             ef.squeeze(0).cpu() if ef is not None else None
                         )
                     except Exception:
-                        emo_globals.append(None)  # SS: failed → None (present=False), not zeros
+                        emo_globals.append(torch.zeros(emotion_enc.raw_dim))
                         emo_frames.append(None)
 
+        # Free GPU memory before prosody (RMVPE also uses GPU)
         del padded_16k, audios_16k
-        # empty_cache() is expensive (GPU sync) — call only occasionally,
-        # not every batch. Periodic clearing prevents fragmentation without
-        # blocking the pipeline each iteration.
-        _batch_count[0] += 1
-        if _batch_count[0] % 50 == 0:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-        # 4. Prosody: CPU backends run in parallel threads.
-        #    RMVPE (GPU) runs as a single batched forward (#2) when the batch
-        #    shares one source sample rate; crepe and mixed-SR batches fall back
-        #    to sequential per-sample to avoid VRAM contention / mis-padding.
+        # 4. Prosody: CPU backends run in parallel threads
+        #    GPU backends (RMVPE/crepe) run sequentially to avoid VRAM contention
         if prosody_on_gpu:
-            srs = {sr for _, _, sr in batch}
-            if prosody_backend == "rmvpe" and len(srs) == 1 and len(batch) > 1:
-                prosody_results = extract_prosody_batch_rmvpe(batch)
-            else:
-                prosody_results = [
-                    extract_prosody_cpu(audio, sr) for _, audio, sr in batch
-                ]
+            prosody_results = []
+            with torch.no_grad():
+                for j, (_, audio, sr) in enumerate(batch):
+                    p_raw, p_mask = prosody_enc.extract_raw(audio.to(device), sr=sr)
+                    prosody_results.append((p_raw.squeeze(0).cpu(), p_mask.squeeze(0).cpu()))
         else:
             n_workers = min(os.cpu_count() or 4, len(batch))
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -674,7 +518,7 @@ def extract_and_cache_embeddings(
             out_path = os.path.join(output_dir, f"{idx}.pt")
             try:
                 save_dict = {
-                    "speaker_raw": spk_raws[j] if torch.is_tensor(spk_raws) else spk_raws[j],
+                    "speaker_raw": spk_raws[j].cpu() if torch.is_tensor(spk_raws) else spk_raws[j],
                     "emotion_global_raw": emo_globals[j],
                 }
                 if emo_frames[j] is not None:
@@ -686,15 +530,9 @@ def extract_and_cache_embeddings(
                 success += 1
             except Exception as e:
                 print(f"  [FAIL] Sample {idx}: {e}")
-                # Save None (not zeros) for failed modalities. The dataset sets
-                # *_present = (field is not None); zeros would be flagged present
-                # and the model would learn an all-zero embedding as a valid
-                # speaker/emotion. None → present=False → correctly dropped.
-                # (prosody/frame already used None; this makes speaker/emotion
-                # consistent with that contract.)
                 save_q.put((out_path, {
-                    "speaker_raw": None,
-                    "emotion_global_raw": None,
+                    "speaker_raw": torch.zeros(speaker_enc.raw_dim, dtype=torch.float32),  # fp32 (cached fp32)
+                    "emotion_global_raw": torch.zeros(emotion_enc.raw_dim, dtype=torch.float16),
                     "emotion_frame_raw": None,
                     "prosody_raw": None,
                     "prosody_mask": None,
@@ -702,40 +540,7 @@ def extract_and_cache_embeddings(
                 failed += 1
             pbar.update(1)
 
-    # Length-bucketed dynamic batching.
-    # Buffer a larger window, sort by length, emit batches of SIMILAR length
-    # under a padded-token budget. Long samples → small batch; short → large.
-    # Minimises padding waste vs fixed-count batches in arrival order.
-    SORT_WINDOW = BATCH_SIZE * 8
-    MAX_BATCH_TOKENS = BATCH_SIZE * 16000
-    MAX_BATCH_SIZE = BATCH_SIZE * 2
-
-    def emit_buffered(buffer, force=False):
-        """Sort buffered samples by length and flush length-homogeneous batches.
-        If not force, keep the longest partial bucket for the next window."""
-        if not buffer:
-            return []
-        buffer.sort(key=lambda x: x[1].shape[-1])
-        i, n = 0, len(buffer)
-        while i < n:
-            j = i
-            max_len = 0
-            while j < n:
-                cand_max = max(max_len, buffer[j][1].shape[-1])
-                cand_count = j - i + 1
-                if cand_count > MAX_BATCH_SIZE:
-                    break
-                if cand_count * cand_max > MAX_BATCH_TOKENS and cand_count > 1:
-                    break
-                max_len = cand_max
-                j += 1
-            if not force and j >= n:
-                return buffer[i:]
-            flush_batch(buffer[i:j])
-            i = j
-        return []
-
-    # Main loop: read from prefetch queue, buffer, sort, flush dynamically
+    # Main loop: read from prefetch queue, batch, flush
     while True:
         item = prefetch_q.get()
         if item is None:
@@ -744,10 +549,9 @@ def extract_and_cache_embeddings(
         if err is not None or audio is None:
             print(f"  [FAIL] Sample {idx}: {err}")
             out_path = os.path.join(output_dir, f"{idx}.pt")
-            # None (not zeros) so the dataset flags these absent via present=False.
             save_q.put((out_path, {
-                "speaker_raw": None,
-                "emotion_global_raw": None,
+                "speaker_raw": torch.zeros(speaker_enc.raw_dim, dtype=torch.float32),  # fp32 (cached fp32)
+                "emotion_global_raw": torch.zeros(emotion_enc.raw_dim, dtype=torch.float16),
                 "emotion_frame_raw": None,
                 "prosody_raw": None,
                 "prosody_mask": None,
@@ -757,18 +561,19 @@ def extract_and_cache_embeddings(
             continue
 
         batch_data.append((idx, audio, sr))
-        if len(batch_data) >= SORT_WINDOW:
-            batch_data = emit_buffered(batch_data, force=False)
+        if len(batch_data) >= BATCH_SIZE:
+            flush_batch(batch_data)
+            batch_data = []
 
-    # Flush remaining (force: emit everything including the tail)
-    emit_buffered(batch_data, force=True)
+    # Flush remaining
+    flush_batch(batch_data)
     # Signal save_worker to stop, then wait for all pending saves
     save_q.put(None)
     save_q.join()
     save_thread.join(timeout=30)
     pbar.close()
     prefetch_thread.join(timeout=5)
-
+    
     print(f"\nDone! Success: {success} | Failed: {failed} | Skipped: {skipped}")
     
     # Save extraction metadata
@@ -948,21 +753,12 @@ def main():
     parser.add_argument("--dataset_dir", type=str, help="Path to prepared dataset")
     parser.add_argument("--embedding_dir", type=str, help="Path to save/load embeddings")
     parser.add_argument("--speaker_backend", type=str, default="wavlm_sv",
-                        choices=["wavlm_sv", "ecapa_tdnn", "resemblyzer", "wavlm_sv_onnx"])
+                        choices=["wavlm_sv", "ecapa_tdnn", "resemblyzer"])
     parser.add_argument("--emotion_backend", type=str, default="emotion2vec_base",
-                        choices=["emotion2vec_base", "emotion2vec_plus", "emotion2vec_plus_large", "emotion2vec_onnx", "wav2vec2_ser", "hubert_ser"])
-    parser.add_argument("--emotion_onnx_path", type=str, default=None,
-                        help="Path to exported emotion2vec_plus_base .onnx "
-                             "(required for --emotion_backend emotion2vec_onnx; "
-                             "also readable from EMOTION2VEC_ONNX_PATH env var)")
+                        choices=["emotion2vec_base", "emotion2vec_plus", "wav2vec2_ser", "hubert_ser", "emotion2vec_onnx"])
     parser.add_argument("--prosody_backend", type=str, default="dio",
                         choices=["dio", "harvest", "crepe", "rmvpe"])
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="GPU encoder batch size (raise it with --amp_dtype to use VRAM)")
-    parser.add_argument("--amp_dtype", type=str, default="fp16",
-                        choices=["fp16", "bf16", "fp32"],
-                        help="Mixed-precision dtype for GPU encoder inference (fp32 = off)")
     parser.add_argument("--resume", action="store_true", default=True)
     
     args = parser.parse_args()
@@ -978,16 +774,12 @@ def main():
     if args.stage in ("embeddings", "all"):
         ds_dir = args.dataset_dir or args.output_dir
         emb_dir = args.embedding_dir or os.path.join(args.output_dir, "embeddings")
-        if getattr(args, "emotion_onnx_path", None):
-            os.environ["EMOTION2VEC_ONNX_PATH"] = args.emotion_onnx_path
         extract_and_cache_embeddings(
             ds_dir, emb_dir,
             speaker_backend=args.speaker_backend,
             emotion_backend=args.emotion_backend,
             prosody_backend=args.prosody_backend,
             device=args.device,
-            batch_size=args.batch_size,
-            amp_dtype=args.amp_dtype,
             resume=args.resume,
         )
     

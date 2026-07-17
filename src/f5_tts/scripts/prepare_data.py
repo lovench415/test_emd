@@ -753,7 +753,7 @@ def main():
     parser.add_argument("--dataset_dir", type=str, help="Path to prepared dataset")
     parser.add_argument("--embedding_dir", type=str, help="Path to save/load embeddings")
     parser.add_argument("--speaker_backend", type=str, default="wavlm_sv",
-                        choices=["wavlm_sv", "ecapa_tdnn", "resemblyzer"])
+                        choices=["wavlm_sv", "ecapa_tdnn", "resemblyzer", "wavlm_sv_onnx"])
     parser.add_argument("--emotion_backend", type=str, default="emotion2vec_base",
                         choices=["emotion2vec_base", "emotion2vec_plus", "wav2vec2_ser", "hubert_ser", "emotion2vec_onnx"])
     parser.add_argument("--prosody_backend", type=str, default="dio",

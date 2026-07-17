@@ -506,77 +506,12 @@ class RMVPE0Predictor:
         audio = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
         mel = self.mel_extractor(audio, center=True)
         del audio
-        # NOTE: do NOT call torch.cuda.empty_cache() here — it forces a GPU
-        # sync on every sample and destroys throughput during batch embedding
-        # extraction. Memory is freed naturally; periodic clearing (if needed)
-        # is handled by the caller.
+        with torch.no_grad():
+            torch.cuda.empty_cache()
         hidden = self.mel2hidden(mel)
         hidden = hidden.squeeze(0).cpu().numpy()
         f0 = self.decode(hidden, thred=thred)
         return f0
-
-    def infer_from_audio_tensor(self, audio_16k: torch.Tensor, thred=0.03):
-        """GPU-native F0 inference — accepts a 16kHz mono tensor already on
-        the right device. Avoids the GPU→numpy→GPU round-trip of
-        infer_from_audio (which costs a host sync per call).
-
-        Args:
-            audio_16k (torch.Tensor): 1D or (1, T) waveform at 16kHz, on self.device.
-            thred (float): salience threshold.
-        Returns:
-            np.ndarray: F0 contour (decode still runs on CPU — it is numpy-based).
-        """
-        if audio_16k.dim() == 1:
-            audio_16k = audio_16k.unsqueeze(0)
-        audio_16k = audio_16k.to(self.device).float()
-        mel = self.mel_extractor(audio_16k, center=True)
-        hidden = self.mel2hidden(mel)
-        hidden = hidden.squeeze(0).cpu().numpy()
-        return self.decode(hidden, thred=thred)
-
-    def infer_from_audio_tensor_batch(self, audio_16k: torch.Tensor,
-                                      lengths: list[int] | None = None,
-                                      thred=0.03) -> list[np.ndarray]:
-        """Batched GPU-native F0 inference (#2).
-
-        Runs the conv/GRU stack once over a padded (B, T) batch instead of one
-        forward per utterance. The network is fully batch-parallel; only the
-        numpy `decode` is per-sample (cheap, CPU). Padding frames are dropped
-        per sample using `lengths` so a short clip's F0 isn't polluted by the
-        silence padded to match the longest clip in the batch.
-
-        Args:
-            audio_16k (torch.Tensor): (B, T) waveform at 16kHz on self.device.
-            lengths: optional list of true sample lengths (at 16kHz) per row.
-            thred (float): salience threshold.
-        Returns:
-            list[np.ndarray]: per-sample F0 contour (trimmed to valid frames).
-        """
-        if audio_16k.dim() == 1:
-            audio_16k = audio_16k.unsqueeze(0)
-        audio_16k = audio_16k.to(self.device).float()
-        B, T = audio_16k.shape
-
-        mel = self.mel_extractor(audio_16k, center=True)   # (B, n_mels, n_frames)
-        hidden = self.mel2hidden(mel)                       # (B, n_frames, bins)
-        hidden_np = hidden.cpu().numpy()
-
-        # Map sample lengths → valid mel frame counts. mel_extractor uses
-        # center=True with the same hop as a single-sample call, so the frame
-        # count scales linearly with sample count; derive each row's valid
-        # frames from the full-length frame count.
-        n_frames_full = hidden_np.shape[1]
-        use_lengths = lengths is not None and len(lengths) == B
-        results = []
-        for i in range(B):
-            if use_lengths:
-                valid = max(1, int(round(n_frames_full * (lengths[i] / float(T)))))
-                valid = min(valid, n_frames_full)
-                sal = hidden_np[i, :valid]
-            else:
-                sal = hidden_np[i]
-            results.append(self.decode(sal, thred=thred))
-        return results
 
     def to_local_average_cents(self, salience, thred=0.05):
         """

@@ -38,7 +38,11 @@ class SpeakerEncoder(BaseEncoder):
         self.backend = backend
         self._use_onnx = False
         self._load_backend(backend, device)
-        self.proj = self.make_projection(self.raw_dim, output_dim)
+        # NOTE: no encoder-side projection head. The pipeline caches RAW embeddings
+        # (extract_raw) and projects them inside the model via
+        # cond_aggregator.speaker_raw_proj (the single canonical, trained head).
+        # An encoder-side `proj` here would never be trained → dead weight and a
+        # source of ambiguity, so it is intentionally omitted.
 
     # ── Backend loading ───────────────────────────────────────────────
 
@@ -311,9 +315,26 @@ class SpeakerEncoder(BaseEncoder):
     # ── Public interface ──────────────────────────────────────────────
 
     def forward(self, wav: torch.Tensor, sr: int = 24000, **_) -> torch.Tensor:
-        """Raw waveform → projected, normalized speaker embedding (B, output_dim)."""
-        raw = self.extract_raw(wav, sr)
-        return self._project_and_normalize(raw, self.proj)
+        """DEPRECATED projection path — do not use.
+
+        There are two speaker projection heads in this codebase and only ONE is
+        canonical:
+          • cond_aggregator.speaker_raw_proj — the CANONICAL head. The pipeline
+            caches RAW embeddings (extract_raw, no projection/normalization) and
+            projects them inside the model, where the head is trained end-to-end
+            and L2-normalization is controlled by the `normalize_speaker` flag.
+          • SpeakerEncoder.proj (used here and in project_cached) — NOT trained by
+            the pipeline (caching never calls it) and always L2-normalizes. Using
+            it yields embeddings incompatible with what the model expects.
+
+        To remove that ambiguity this path now raises. Use extract_raw() for
+        caching and let cond_aggregator.speaker_raw_proj do the projection.
+        """
+        raise NotImplementedError(
+            "SpeakerEncoder.forward()/project_cached() use the encoder-side `proj` "
+            "head, which the pipeline never trains. Use extract_raw() and project via "
+            "cond_aggregator.speaker_raw_proj (the canonical, trained head)."
+        )
 
     @torch.no_grad()
     def precompute(self, wav: torch.Tensor, sr: int = 24000) -> torch.Tensor:
@@ -321,5 +342,9 @@ class SpeakerEncoder(BaseEncoder):
         return self.extract_raw(wav, sr).cpu()
 
     def project_cached(self, raw_emb: torch.Tensor, **_) -> torch.Tensor:
-        """Project a precomputed raw embedding through the trainable head."""
-        return self._project_and_normalize(raw_emb, self.proj)
+        """DEPRECATED — see forward(). The canonical projection is
+        cond_aggregator.speaker_raw_proj, not this encoder-side head."""
+        raise NotImplementedError(
+            "SpeakerEncoder.project_cached() uses the untrained encoder-side `proj`. "
+            "Project raw embeddings via cond_aggregator.speaker_raw_proj instead."
+        )

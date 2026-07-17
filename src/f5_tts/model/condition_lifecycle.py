@@ -111,22 +111,11 @@ class ConditionLifecycleManager:
 
         wav = raw_audio[need_any_online]
         sr = batch["sample_rate"]
-        # True per-row lengths (pre-padding) for the selected subset, so the
-        # encoders can mask trailing zero-padding instead of pooling over silence.
-        # Absent for legacy collate/caches → fall back to None (previous behavior).
-        raw_audio_lengths = batch.get("raw_audio_lengths")
-        sel_lengths = None
-        if raw_audio_lengths is not None:
-            sel_lengths = raw_audio_lengths.to(device)[need_any_online]
         with torch.no_grad():
-            online_spk = (
-                speaker_encoder.extract_raw(wav, sr=sr, lengths=sel_lengths)
-                if (speaker_encoder is not None and need_spk_rows[need_any_online].any())
-                else None
-            )
+            online_spk = speaker_encoder.extract_raw(wav, sr=sr) if (speaker_encoder is not None and need_spk_rows[need_any_online].any()) else None
             if emotion_encoder is not None and (need_emo_g_rows[need_any_online].any() or need_emo_f_rows[need_any_online].any()):
                 if hasattr(emotion_encoder, "extract_raw_with_mask"):
-                    online_emo = emotion_encoder.extract_raw_with_mask(wav, sr=sr, lengths=sel_lengths)
+                    online_emo = emotion_encoder.extract_raw_with_mask(wav, sr=sr)
                 else:
                     online_emo = emotion_encoder.extract_raw(wav, sr=sr)
             else:
@@ -252,33 +241,6 @@ class ConditionLifecycleManager:
         if model_conditions is not None:
             if not isinstance(model_conditions, ModelConditionBatch):
                 raise TypeError("model_conditions must be a ModelConditionBatch")
-            # Pass-through: model-space conditions are already projected and
-            # time-aligned by an earlier prepare() call. target_len is NOT used
-            # to re-align here (that would double-interpolate). But the caller's
-            # target_len MUST match the length these conditions were aligned to,
-            # otherwise the conditioning time axis won't match the mel the model
-            # generates. This contract previously held only because infer and
-            # sample() recomputed the SAME duration formula independently; if
-            # those ever diverge, silently mismatched axes are far harder to
-            # debug than an explicit failure here.
-            if target_len is not None:
-                for name in ("emotion_frame", "prosody_frame", "prosody_direct"):
-                    t = getattr(model_conditions, name)
-                    if t is not None and t.dim() >= 2 and t.shape[1] != target_len:
-                        raise ValueError(
-                            f"model_conditions.{name} has time length {t.shape[1]} but "
-                            f"target_len={target_len}. Model-space conditions must already be "
-                            f"aligned to target_len (they are passed through, not re-aligned). "
-                            f"This usually means the duration/target_len computed before "
-                            f"prepare() disagrees with the length used by sample()."
-                        )
-                for name in ("emotion_frame_mask", "prosody_mask"):
-                    m = getattr(model_conditions, name)
-                    if m is not None and m.dim() >= 2 and m.shape[-1] != target_len:
-                        raise ValueError(
-                            f"model_conditions.{name} has time length {m.shape[-1]} but "
-                            f"target_len={target_len}; conditioning masks must match target_len."
-                        )
             return model_conditions
 
         if batch is not None:
@@ -435,8 +397,15 @@ class ConditionLifecycleManager:
         return ModelConditionBatch(
             speaker=model_conditions.speaker,
             emotion_global=model_conditions.emotion_global,
-            emotion_frame=model_conditions.emotion_frame,
-            prosody_frame=model_conditions.prosody_frame,
+            emotion_frame=None,   # None → emotion cross-attn skipped (same reasoning
+                                  # as prosody_frame: don't rely on a zeroed mask alone
+                                  # for unconditionality). emotion_direct is already
+                                  # absent here (not carried over → defaults to None).
+            prosody_frame=None,   # None → prosody cross-attn skipped. Explicit (not
+                                  # just relying on a zeroed mask + cond_mask.any()
+                                  # guard) so the uncond branch is fully unconditional
+                                  # on prosody → CFG direction (f − u) isn't biased by
+                                  # leftover prosody, symmetric with direct/global.
             prosody_direct=None,  # None → direct addition skipped
             prosody_global=None,  # None → AdaLN enrichment skipped
             speaker_present=zeros_sp,

@@ -482,8 +482,16 @@ class EmotionEncoder(BaseEncoder):
     def forward(
         self, wav: torch.Tensor, sr: int = 24000, target_len: int | None = None, **_,
     ) -> dict[str, torch.Tensor]:
-        """
-        Full pipeline → {"global": (B, D), "frame": (B, T', D)}.
+        """DEPRECATED projection path — see note below.
+
+        Like SpeakerEncoder, the pipeline caches RAW emotion features
+        (extract_raw / extract_raw_with_mask) and projects them inside the model
+        via cond_aggregator.emotion_raw_proj / frame_raw_proj (the canonical,
+        trained heads, which also apply the emotion_bottleneck). The encoder-side
+        global_proj / frame_proj used here are NOT trained by the pipeline and
+        always L2-normalize → embeddings incompatible with the model. Do not use
+        forward()/project_cached() for the training/inference pipeline; use
+        extract_raw and let the model project.
         """
         global_feat, frame_feat = self.extract_raw(wav, sr)
 

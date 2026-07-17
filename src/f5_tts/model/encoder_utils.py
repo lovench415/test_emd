@@ -28,7 +28,6 @@ SPEAKER_RAW_DIMS: dict[str, int] = {
 EMOTION_RAW_DIMS: dict[str, int] = {
     "emotion2vec_base": 768,
     "emotion2vec_plus": 768,
-    "emotion2vec_plus_large": 1024,  # likely 1024 (large); auto-detected at load
     "emotion2vec_onnx": 768,
     "wav2vec2_ser": 1024,
     "hubert_ser": 1024,

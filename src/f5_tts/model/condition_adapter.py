@@ -22,10 +22,6 @@ class ConditionAdapter:
             )
 
     def align_frame(self, emotion_frame, emotion_frame_mask, target_len):
-        # Reverted to interpolation (matches the known-good training/inference
-        # regime). An earlier pad+mask variant was tried to curb cross-language
-        # leakage but the proven-working version interpolates, and the leak was
-        # later traced to the ref_text prefix, not this path.
         if emotion_frame is None:
             return None, None
         if emotion_frame.shape[1] != target_len:
@@ -91,6 +87,7 @@ class ConditionAdapter:
 
         return self.conditioning_module.project_model_conditions(
             speaker_raw=conditions.speaker_raw,
+            timbre_raw=conditions.timbre_raw,
             emotion_global_raw=conditions.emotion_global_raw,
             emotion_frame_raw=emotion_frame,
             prosody_raw=prosody_raw,

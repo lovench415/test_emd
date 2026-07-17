@@ -8,7 +8,93 @@ from torch.utils.data import Sampler
 from tqdm import tqdm
 
 
-class DynamicBatchSampler(Sampler[list[int]]):
+# Distinct prime offsets so the per-(seed, epoch, round) reshuffle keys of the
+# different samplers don't collide and so each reshuffle round differs. Named here
+# once instead of being copied as magic numbers across every sampler.
+_EPOCH_STRIDE = 100003
+_ROUND_SALT = 99991
+
+
+class _DynamicBatchSamplerBase(Sampler[list[int]]):
+    """Shared behaviour for the dynamic batch samplers.
+
+    Centralizes the two pieces that were previously copy-pasted into every sampler
+    (and thus drifted when one was fixed but the others weren't):
+
+      • _reshuffle_iter: iterate self.batches, and every rebuild_every_n_steps yield
+        a SEEDED reshuffle of the remainder keyed by (seed, epoch, round). Seeding
+        is what keeps DDP ranks in lockstep (a bare random.shuffle reads the global
+        RNG, which diverges across processes); the round counter keeps successive
+        reshuffles distinct yet reproducible. Falls back to the global RNG only when
+        no seed was set.
+
+      • __len__: a STABLE nominal length cached on first access. Subclasses that
+        repack per epoch (set_epoch → _rebuild_batches) otherwise return a count that
+        drifts a few % each epoch, which desyncs a step-based LR scheduler.
+
+    Subclasses set self.batches, self.random_seed, self.epoch, and
+    self.rebuild_every_n_steps, then use these helpers.
+
+    ─────────────────────────────────────────────────────────────────────────────
+    SHARDING MODEL (read before changing anything DDP-related)
+
+    These are BATCH samplers that do NOT shard by rank — there is no rank /
+    num_replicas here. Each builds ONE GLOBAL list of batches, and the per-rank
+    split is done by Accelerate ON TOP of that list (accelerator.prepare wraps the
+    DataLoader and hands out batches round-robin across processes). That choice is
+    what makes the schedule-horizon math elsewhere use
+    `len(dataloader) / num_processes` rather than len directly.
+
+    This pattern is CORRECT, but only while three conditions hold — break any one
+    and ranks silently desync (process different data, or hang on all-reduce):
+
+      1. DETERMINISTIC GLOBAL LIST. Every rank must build the IDENTICAL global
+         batch list, or round-robin hands different batches to each rank. The plain
+         DynamicBatchSampler is deterministic (it sorts by length). The bucket /
+         speaker samplers shuffle, so they are deterministic ONLY when random_seed
+         is not None. The trainer passes --seed (default 666), so this holds; if a
+         caller ever sets seed=None on multi-GPU, the global lists diverge.
+
+      2. EVEN BATCH COUNT. If the number of global batches isn't divisible by
+         num_processes, round-robin gives one rank an extra batch. DDP requires the
+         SAME number of optimizer steps per rank or it hangs on gradient all-reduce.
+         Accelerate's even_batches (default True) handles this by trimming/padding;
+         don't disable it for these samplers without adding explicit drop_last logic.
+
+      3. SYNCHRONIZED set_epoch. Every rank must call set_epoch(epoch) with the same
+         epoch so the per-epoch repack (same seed+epoch) reproduces the same global
+         list on every rank. The training loop does this once per epoch for all ranks.
+
+    If any of these becomes hard to guarantee, the robust alternative is a
+    self-sharding sampler (own rank/num_replicas that slices its own shard), which
+    removes the dependency on Accelerate's round-robin entirely.
+    """
+
+    def _reshuffle_iter(self, salt: int = 0, batches=None):
+        remaining = list(self.batches if batches is None else batches)
+        step = 0
+        reshuffle_round = 0
+        while remaining:
+            yield remaining.pop(0)
+            step += 1
+            if (self.rebuild_every_n_steps > 0
+                    and step % self.rebuild_every_n_steps == 0 and remaining):
+                if self.random_seed is not None:
+                    r = random.Random(self.random_seed
+                                      + self.epoch * _EPOCH_STRIDE
+                                      + salt + reshuffle_round)
+                    r.shuffle(remaining)
+                else:
+                    random.shuffle(remaining)
+                reshuffle_round += 1
+
+    def _stable_len(self) -> int:
+        if getattr(self, "_nominal_len", None) is None:
+            self._nominal_len = len(self.batches)
+        return self._nominal_len
+
+
+class DynamicBatchSampler(_DynamicBatchSamplerBase):
     """Batch by total frame count, with deterministic per-epoch shuffle."""
 
     def __init__(
@@ -82,27 +168,13 @@ class DynamicBatchSampler(Sampler[list[int]]):
 
         if self.rebuild_every_n_steps <= 0:
             return iter(batches)
-
-        def _iter_with_reshuffle():
-            remaining = list(batches)
-            i = 0
-            step = 0
-            while i < len(remaining):
-                yield remaining[i]
-                i += 1
-                step += 1
-                if step % self.rebuild_every_n_steps == 0 and i < len(remaining):
-                    # Reshuffle only the not-yet-yielded tail (O(tail) not O(N))
-                    tail = remaining[i:]
-                    random.shuffle(tail)
-                    remaining[i:] = tail
-        return _iter_with_reshuffle()
+        return self._reshuffle_iter(batches=batches)
 
     def __len__(self):
         return len(self.batches)
 
 
-class BucketDynamicBatchSampler(Sampler[list[int]]):
+class BucketDynamicBatchSampler(_DynamicBatchSamplerBase):
     def __init__(
         self,
         sampler: Sampler[int],
@@ -163,27 +235,14 @@ class BucketDynamicBatchSampler(Sampler[list[int]]):
     def __iter__(self):
         if self.rebuild_every_n_steps <= 0:
             return iter(self.batches)
-
-        def _iter_with_reshuffle():
-            remaining = list(self.batches)
-            i = 0
-            step = 0
-            while i < len(remaining):
-                yield remaining[i]
-                i += 1
-                step += 1
-                if step % self.rebuild_every_n_steps == 0 and i < len(remaining):
-                    tail = remaining[i:]
-                    random.shuffle(tail)
-                    remaining[i:] = tail
-        return _iter_with_reshuffle()
+        return self._reshuffle_iter()
 
     def __len__(self):
-        return len(self.batches)
+        return self._stable_len()
 
 
 
-class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
+class SpeakerAwareBucketDynamicBatchSampler(_DynamicBatchSamplerBase):
     def __init__(
         self,
         sampler: Sampler[int],
@@ -365,33 +424,17 @@ class SpeakerAwareBucketDynamicBatchSampler(Sampler[list[int]]):
 
     def __iter__(self):
         if self.rebuild_every_n_steps <= 0:
-            # Standard: yield all pre-built batches
-            for batch in self.batches:
-                yield batch
-        else:
-            # Mid-epoch reshuffle of not-yet-yielded batches.
-            # Index-based (no pop(0)) → O(N) total, not O(N²).
-            remaining = list(self.batches)
-            i = 0
-            step = 0
-            while i < len(remaining):
-                yield remaining[i]
-                i += 1
-                step += 1
-                if step % self.rebuild_every_n_steps == 0 and i < len(remaining):
-                    # Independent shuffle each time (no fixed seed) — reshuffle
-                    # tail only. random.shuffle is in-place and unseeded → each
-                    # reshuffle within an epoch is independently random.
-                    tail = remaining[i:]
-                    random.shuffle(tail)
-                    remaining[i:] = tail
+            return iter(self.batches)
+        # salt=_ROUND_SALT keeps this sampler's reshuffle keys distinct from the
+        # plain dynamic sampler's, so the two don't produce correlated orders.
+        return self._reshuffle_iter(salt=_ROUND_SALT)
 
     def __len__(self):
-        return len(self.batches)
+        return self._stable_len()
 
 
 
-class SpeakerBalancedDynamicBatchSampler(Sampler[list[int]]):
+class SpeakerBalancedDynamicBatchSampler(_DynamicBatchSamplerBase):
     def __init__(
         self,
         sampler: Sampler[int],
@@ -475,7 +518,7 @@ class SpeakerBalancedDynamicBatchSampler(Sampler[list[int]]):
                         remaining.append(idx)
                         continue
 
-                    if len(batch) + len(local_added) >= self.max_samples:
+                    if self.max_samples and len(batch) + len(local_added) >= self.max_samples:
                         remaining.append(idx)
                         continue
 
@@ -494,43 +537,32 @@ class SpeakerBalancedDynamicBatchSampler(Sampler[list[int]]):
                     # return unconsumed plus any trailing items
                     consumed = set(local_added)
                     speaker_to_indices[sp] = [i for i in speaker_to_indices[sp] if i not in consumed]
-                elif local_added and not remaining:
-                    # Speaker is EXHAUSTED: it had fewer than samples_per_speaker
-                    # items left, and none were blocked by batch limits (remaining
-                    # is empty). Returning them would leave speaker_to_indices[sp]
-                    # non-empty forever → active_speakers never shrinks → infinite
-                    # loop in the while-loop. Take the partial group and consume
-                    # them so the speaker empties out.
-                    batch.extend(local_added)
-                    frames += local_frames
-                    kept_speakers += 1
-                    consumed = set(local_added)
-                    speaker_to_indices[sp] = [i for i in speaker_to_indices[sp] if i not in consumed]
                 else:
-                    # Could not fill the quota because batch limits (max_samples /
-                    # frames_threshold) blocked items (remaining is non-empty), or
-                    # nothing could be added at all. Return everything so these
-                    # samples are retried in a later batch. Safe from infinite loop:
-                    # this branch only runs when the batch already holds items from
-                    # other speakers (so the batch will be emitted and limits reset),
-                    # or local_added is empty (speaker contributed nothing this round
-                    # but its items remain available as the batch frees up).
+                    # could not satisfy full quota for this speaker in this batch
                     speaker_to_indices[sp] = local_added + remaining + [i for i in speaker_to_indices[sp] if i not in local_added and i not in remaining]
 
             if kept_speakers > 0 and (not self.drop_residual or kept_speakers == len(chosen_speakers)):
                 batch.sort(key=lambda i: data_source.get_frame_len(i))
                 batches.append(batch)
 
-            # Termination guard: if no speaker contributed any samples this round,
-            # speaker_to_indices cannot shrink and active_speakers would stay the
-            # same → infinite loop. This can only happen when every remaining
-            # sample is individually un-batchable under the current constraints;
-            # stop rather than spin. (The partial-group consumption above handles
-            # the common exhausted-speaker case; this is the final backstop.)
+            # Guarantee progress. A speaker with fewer than samples_per_speaker items
+            # left can never fill its quota: its items get returned unchanged each
+            # round and it stays "active" forever → infinite loop. If this round
+            # produced no batch (kept_speakers == 0), drop every speaker that cannot
+            # reach the quota so their leftovers become residual instead of spinning.
+            # When progress was made, only prune now-empty speakers as before.
             if kept_speakers == 0:
-                break
-
-            active_speakers = [sp for sp in active_speakers if speaker_to_indices[sp]]
+                before = len(active_speakers)
+                active_speakers = [
+                    sp for sp in active_speakers
+                    if len(speaker_to_indices[sp]) >= self.samples_per_speaker
+                ]
+                # Absolute safety net: if we still made no progress (same active set),
+                # stop rather than risk spinning on an unforeseen edge case.
+                if len(active_speakers) == before:
+                    break
+            else:
+                active_speakers = [sp for sp in active_speakers if speaker_to_indices[sp]]
             rng.shuffle(active_speakers)
 
         if self.random_seed is not None:
@@ -542,8 +574,10 @@ class SpeakerBalancedDynamicBatchSampler(Sampler[list[int]]):
         self.batches = batches
 
     def __iter__(self):
+        # This sampler re-packs fully on set_epoch and does not reshuffle mid-epoch,
+        # so it just yields the current batches.
         for b in self.batches:
             yield b
 
     def __len__(self):
-        return len(self.batches)
+        return self._stable_len()

@@ -10,6 +10,7 @@ from f5_tts.model.modules import (
 )
 from f5_tts.model.backbones.dit import TextEmbedding
 from f5_tts.model.condition_types import ConditioningRuntime
+from f5_tts.model.timbre_encoder import TimbreEncoder
 from f5_tts.model.conditioning import ConditioningAggregator
 
 
@@ -80,23 +81,25 @@ class EnhancedDiT(nn.Module):
         long_skip_connection=False, checkpoint_activations=False,
         speaker_emb_dim: int = 512, emotion_emb_dim: int = 512,
         speaker_raw_dim: int | None = None, emotion_raw_dim: int | None = None,
+        use_timbre_encoder: bool = False, timbre_dim: int = 512,
         cross_attn_layers: list[int] | None = None,
         cross_attn_heads: int = 8, cross_attn_dim_head: int = 64,
         use_adaln_cond: bool = True, use_input_add_cond: bool = True,
         use_cross_attn_cond: bool = True, adaln_bottleneck_dim: int = 256,
+        emotion_bottleneck_dim: int = 0,
+        use_emotion_direct: bool = False,
+        normalize_speaker: bool = False,
+        fusion_mode: str = "concat",
+        adaln_speaker_only: bool = False,
+        prosody_in_adaln: bool = False,
         # Prosody
         prosody_dim: int = 256,
         prosody_raw_dim: int | None = None,
         use_prosody_cross_attn: bool = True,
-        use_prosody_direct: bool = True,
-        fusion_mode: str = "concat",
-        cross_attn_gate_floor: float = 0.0,
         prosody_cross_attn_layers: list[int] | None = None,
         prosody_cross_attn_heads: int = 8,
         prosody_cross_attn_dim_head: int = 64,
         prosody_direct_layers: list[int] | None = None,
-        speaker_emb_dropout: float = 0.0,
-        speaker_emb_noise: float = 0.0,
     ):
         super().__init__()
         self.dim = dim
@@ -116,22 +119,31 @@ class EnhancedDiT(nn.Module):
         self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
         self.norm_out = AdaLayerNorm_Final(dim)
         self.proj_out = nn.Linear(dim, mel_dim)
+        # Learnable timbre encoder (MiniMax-style): extracts timbre from the prompt
+        # mel and augments the WavLM-SV speaker path (multi-level). Built only when
+        # use_timbre_encoder=True; otherwise None and the model behaves as before.
+        self.timbre_encoder = (
+            TimbreEncoder(n_mels=mel_dim, timbre_dim=timbre_dim, return_frame=False)
+            if use_timbre_encoder else None
+        )
         self.cond_aggregator = ConditioningAggregator(
             speaker_dim=speaker_emb_dim, emotion_dim=emotion_emb_dim, model_dim=dim, n_blocks=depth,
             cross_attn_layers=cross_attn_layers, cross_attn_heads=cross_attn_heads, cross_attn_dim_head=cross_attn_dim_head,
             use_adaln=use_adaln_cond, use_input_add=use_input_add_cond, use_cross_attn=use_cross_attn_cond, dropout=dropout,
             speaker_raw_dim=speaker_raw_dim, emotion_raw_dim=emotion_raw_dim, adaln_bottleneck_dim=adaln_bottleneck_dim,
+            timbre_raw_dim=(timbre_dim if use_timbre_encoder else None),
+            emotion_bottleneck_dim=emotion_bottleneck_dim,
+            use_emotion_direct=use_emotion_direct,
+            normalize_speaker=normalize_speaker,
             prosody_dim=prosody_dim, prosody_raw_dim=prosody_raw_dim,
             use_prosody_cross_attn=use_prosody_cross_attn,
-            use_prosody_direct=use_prosody_direct,
-            fusion_mode=fusion_mode,
-            cross_attn_gate_floor=cross_attn_gate_floor,
             prosody_cross_attn_layers=prosody_cross_attn_layers,
             prosody_cross_attn_heads=prosody_cross_attn_heads,
             prosody_cross_attn_dim_head=prosody_cross_attn_dim_head,
             prosody_direct_layers=prosody_direct_layers,
-            speaker_emb_dropout=speaker_emb_dropout,
-            speaker_emb_noise=speaker_emb_noise,
+            fusion_mode=fusion_mode,
+            adaln_speaker_only=adaln_speaker_only,
+            prosody_in_adaln=prosody_in_adaln,
         )
         self._init_weights()
 

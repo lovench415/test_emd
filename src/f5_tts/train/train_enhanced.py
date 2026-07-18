@@ -1718,7 +1718,28 @@ def main():
                       " Training continues from pretrained weights.")
         
         if is_main and ema and "ema_model_state_dict" in ckpt:
-            ema.load_state_dict(ckpt["ema_model_state_dict"])
+            # strict=False: a checkpoint from an EARLIER stage/config may lack keys
+            # for a module introduced only in THIS run (e.g. --use_duration_predictor
+            # added on stage 2 when stage 1 didn't have it, or --use_timbre_encoder
+            # added later). Those modules simply don't exist in the old EMA yet, so
+            # there's nothing to restore for them — their fresh-init EMA values
+            # (from constructing the model/EMA for THIS run, which already includes
+            # them per the current CLI flags) are exactly what we want to keep.
+            # A strict load would hard-crash the whole resume for what is actually
+            # an expected, benign situation whenever the flag set changes between
+            # stages.
+            missing_ema, unexpected_ema = ema.load_state_dict(
+                ckpt["ema_model_state_dict"], strict=False)
+            if missing_ema:
+                print(f"  [EMA] {len(missing_ema)} keys not in checkpoint (kept at "
+                      f"fresh init — likely a module added in this run, e.g. "
+                      f"duration_predictor/timbre_encoder): {missing_ema[:6]}"
+                      f"{'...' if len(missing_ema) > 6 else ''}")
+            if unexpected_ema:
+                print(f"  [EMA] {len(unexpected_ema)} keys in checkpoint not used by "
+                      f"this model (ignored — likely a module present in the old run "
+                      f"but not this one): {unexpected_ema[:6]}"
+                      f"{'...' if len(unexpected_ema) > 6 else ''}")
             # Re-seed the EMA shadow with online weights for params that are trainable
             # in THIS stage. Without this, modules frozen in an earlier stage carry a
             # stale (near-init) EMA value that lags badly once they unfreeze, so

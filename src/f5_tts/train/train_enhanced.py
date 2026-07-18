@@ -194,25 +194,6 @@ def parse_args():
                    help="Variant C: AdaLN carries ONLY speaker (no emotion correction, "
                         "no prosody_global) → clean speaker modulation. Emotion/prosody "
                         "reach DiT via cross-attn/direct instead.")
-    g.add_argument("--prosody_in_adaln", action="store_true",
-                   help="Re-enable prosody_global enrichment in AdaLN EVEN under "
-                        "--adaln_speaker_only. Gives speaker-only emotion handling AND "
-                        "prosody stats (absolute pitch register) in AdaLN. Useful to "
-                        "feed pitch register back into AdaLN when per-utterance / "
-                        "relative_only normalization stripped it from frame features.")
-    g.add_argument("--prosody_global_in_stage1", action="store_true",
-                   help="In the lightweight curriculum, train prosody_global already "
-                        "in Stage 1 (Speaker) instead of Stage 2. prosody_global feeds "
-                        "the same AdaLN channel as speaker and carries register stats. "
-                        "Only effective when prosody_global is live in AdaLN "
-                        "(speaker_only OFF or --prosody_in_adaln).")
-    g.add_argument("--use_timbre_encoder", action="store_true",
-                   help="Add a learnable timbre encoder (MiniMax-style) over the prompt "
-                        "mel that AUGMENTS the WavLM-SV speaker path (multi-level). Starts "
-                        "as a no-op (zero-init gate) and learns timbre detail jointly with "
-                        "the TTS. Reference is the prompt region (no target leakage).")
-    g.add_argument("--timbre_dim", type=int, default=512,
-                   help="Output dim of the timbre encoder (default 512, matches speaker).")
 
     g = p.add_argument_group("duration predictor")
     g.add_argument("--use_duration_predictor", action="store_true", help="Train prosody-conditioned duration predictor")
@@ -308,9 +289,6 @@ def build_model(args, vocab_size: int) -> EnhancedCFM:
         fusion_mode=args.fusion_mode,
         # Variant C: AdaLN carries only speaker (clean modulation).
         adaln_speaker_only=args.adaln_speaker_only,
-        use_timbre_encoder=getattr(args, "use_timbre_encoder", False),
-        timbre_dim=getattr(args, "timbre_dim", 512),
-        prosody_in_adaln=getattr(args, 'prosody_in_adaln', False),
         normalize_speaker=getattr(args, 'normalize_speaker', False),
     )
 
@@ -390,8 +368,7 @@ def sync_ema_to_online_for_trainable(ema, model):
 
 def apply_curriculum_stage_light(model, stage: int,
                                  unfreeze_top_k: int = 0,
-                                 freeze_adaln: bool = False,
-                                 prosody_global_in_stage1: bool = False):
+                                 freeze_adaln: bool = False):
     """Curriculum for the LIGHTWEIGHT A+C config (no cross-attn).
 
     For models trained with --no_cross_attn --no_prosody_cross_attn
@@ -442,8 +419,7 @@ def apply_curriculum_stage_light(model, stage: int,
     # prosody_direct trains at stage 2, emotion_direct at stage 3.
     if stage < 2:
         zero_param("prosody_block_gates", 0.0)
-        if not (stage == 1 and prosody_global_in_stage1):
-            zero_param("prosody_global_gate", 0.0)
+        zero_param("prosody_global_gate", 0.0)
     if stage < 3:
         zero_param("emotion_block_gates", 0.0)
 
@@ -456,15 +432,6 @@ def apply_curriculum_stage_light(model, stage: int,
     # ── Stage 1: Speaker ──
     if stage >= 1:
         unfreeze(getattr(agg, "speaker_raw_proj", None))
-        # Learnable timbre path is part of speaker (identity) modeling, so it trains
-        # in the Speaker stage. TimbreEncoder lives on the transformer; the proj+gate
-        # that fuse it into the speaker embedding live on the aggregator.
-        unfreeze(getattr(agg, "timbre_proj", None))
-        if getattr(agg, "timbre_gate", None) is not None:
-            agg.timbre_gate.requires_grad_(True)
-        _tr = getattr(model, "transformer", None)
-        if _tr is not None:
-            unfreeze(getattr(_tr, "timbre_encoder", None))
         # Speaker-side fusion only. In concat mode this is `fusion`; in residual mode
         # it's `fusion_speaker`. We do NOT unfreeze `fusion_emotion` here: under
         # adaln_speaker_only emotion is force-dropped from the fused vector, so
@@ -476,37 +443,24 @@ def apply_curriculum_stage_light(model, stage: int,
         if not getattr(agg, "adaln_speaker_only", False):
             unfreeze(getattr(agg, "fusion_emotion", None))
 
-        # Optionally train prosody_global already in the Speaker stage: same AdaLN
-        # channel as speaker, carries register stats (mean_abs_f0). Only when live in
-        # AdaLN (speaker_only OFF or prosody_in_adaln).
-        if prosody_global_in_stage1:
-            pg_live_s1 = (not getattr(agg, "adaln_speaker_only", False)
-                          or getattr(agg, "prosody_in_adaln", False))
-            if pg_live_s1:
-                unfreeze(getattr(agg, "prosody_global_proj", None))
-                unfreeze(getattr(agg, "prosody_raw_proj", None))
-                restore_gate("prosody_global_gate", 0.02)
-
     # ── Stage 2: Prosody (direct + global) + duration ──
     if stage >= 2:
         # prosody_direct is the always-active positional path. prosody_global feeds
         # AdaLN enrichment, which is SKIPPED under adaln_speaker_only → dead there,
         # so only unfreeze it when speaker_only is OFF (mirrors fusion_emotion).
         speaker_only = getattr(agg, "adaln_speaker_only", False)
-        # prosody_global alive in AdaLN when speaker_only OFF OR prosody_in_adaln on.
-        pg_live = (not speaker_only) or getattr(agg, "prosody_in_adaln", False)
         direct_names = ["prosody_direct_proj", "prosody_temporal_smooth", "prosody_raw_proj"]
-        if pg_live:
+        if not speaker_only:
             direct_names.append("prosody_global_proj")
         for name in direct_names:
             unfreeze(getattr(agg, name, None))
         if stage == 2:
             restore_gate("prosody_block_gates", 0.02)
-            if pg_live:
+            if not speaker_only:
                 restore_gate("prosody_global_gate", 0.02)
         else:
             gate_attrs = ["prosody_block_gates"]
-            if pg_live:
+            if not speaker_only:
                 gate_attrs.append("prosody_global_gate")
             for attr in gate_attrs:
                 p = getattr(agg, attr, None)
@@ -664,13 +618,6 @@ def apply_curriculum_stage(model, stage: int,
     if stage >= 1:
         # Speaker global identity
         unfreeze(getattr(agg, "speaker_raw_proj", None))
-        # Timbre path trains with speaker (identity) in Stage 1.
-        unfreeze(getattr(agg, "timbre_proj", None))
-        if getattr(agg, "timbre_gate", None) is not None:
-            agg.timbre_gate.requires_grad_(True)
-        _tr = getattr(model, "transformer", None)
-        if _tr is not None:
-            unfreeze(getattr(_tr, "timbre_encoder", None))
 
     if stage >= 2:
         # Prosody — all three paths
@@ -811,8 +758,6 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
         "fusion",           # speaker_emb + emotion_emb → fused_global
         "speaker_raw_proj", # raw WavLM-SV → speaker_emb (stable per utterance)
         "input_add",        # fused_global → DiT input residual
-        "timbre_proj",      # learnable timbre → speaker_emb (identity augmentation)
-        "timbre_gate",      # gate for the timbre path (identity signal)
     ]
     for name in speaker_module_names:
         mod = getattr(agg, name, None)
@@ -822,15 +767,6 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
             else:
                 for p in mod.parameters():
                     speaker_ids.add(id(p))
-
-    # The TimbreEncoder itself lives on the transformer (not the aggregator). It is
-    # part of speaker-identity modeling, so it belongs in the speaker LR group too —
-    # keeps the whole timbre path (encoder + proj + gate) on the same LR as speaker,
-    # so --lr_speaker_mult controls them together.
-    _timbre_enc = getattr(model.transformer, "timbre_encoder", None) if hasattr(model, "transformer") else None
-    if _timbre_enc is not None:
-        for p in _timbre_enc.parameters():
-            speaker_ids.add(id(p))
 
     # Emotion group: all emotion-related modules together
     #
@@ -848,9 +784,7 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
     emotion_module_names = [
         "emotion_raw_proj",   # global emotion projection (variable per utterance)
         "cross_attns",        # emotion frame cross-attention
-        "emo_prosody_fusion",
-        "emotion_direct_proj", 
-        "emotion_temporal_smooth",# emotion↔prosody cross-modal fusion
+        "emo_prosody_fusion", # emotion↔prosody cross-modal fusion
     ]
     for name in emotion_module_names:
         mod = getattr(agg, name, None)
@@ -860,12 +794,7 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
             else:
                 for p in mod.parameters():
                     emotion_ids.add(id(p))
-    
-    for attr in ("emotion_block_gates"):
-        p = getattr(agg, attr, None)
-        if p is not None and isinstance(p, nn.Parameter):
-            emotion_ids.add(id(p))
-    
+
     # Cross-attention modules: prosody attention only (emotion moved to emotion group)
     cross_attn_module_names = [
         "prosody_cross_attns",   # prosody frame cross-attention blocks
@@ -894,7 +823,9 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
     # prosody_direct (per-block gates, zero-init, not a fragile cross-attn gate), so
     # it wants the same fast LR and must NOT be swept into cross_attn extended warmup.
     prosody_module_names = [
-        "prosody_direct_proj", "prosody_temporal_smooth", "prosody_global_proj"]
+        "prosody_direct_proj", "prosody_temporal_smooth", "prosody_global_proj",
+        "emotion_direct_proj", "emotion_temporal_smooth",
+    ]
     for name in prosody_module_names:
         mod = getattr(agg, name, None)
         if mod is not None:
@@ -904,7 +835,7 @@ def build_param_groups(model: EnhancedCFM, args) -> list[dict]:
                 for p in mod.parameters():
                     prosody_ids.add(id(p))
     # Scalar gates for prosody + emotion direct
-    for attr in ("prosody_block_gates", "prosody_global_gate"):
+    for attr in ("prosody_block_gates", "prosody_global_gate", "emotion_block_gates"):
         p = getattr(agg, attr, None)
         if p is not None and isinstance(p, nn.Parameter):
             prosody_ids.add(id(p))
@@ -1421,8 +1352,6 @@ def save_checkpoint(
         agg = model.transformer.cond_aggregator
         payload["arch_flags"] = {
             "adaln_speaker_only": bool(getattr(agg, "adaln_speaker_only", False)),
-            "prosody_in_adaln": bool(getattr(agg, "prosody_in_adaln", False)),
-            "use_timbre_encoder": bool(getattr(model.transformer, "timbre_encoder", None) is not None) if hasattr(model, "transformer") else False,
             "normalize_speaker": bool(getattr(agg, "normalize_speaker", False)),
             "fusion_mode": getattr(agg, "fusion_mode", "concat"),
         }
@@ -1556,7 +1485,7 @@ def main():
               f"train_stage={args.train_stage}")
     if args.train_stage > 0:
         if args.train_stage >= 2:
-            last_ckpt = args.pretrain_ckpt
+            last_ckpt = os.path.join(args.checkpoint_dir, "model_last.pt")
             if not os.path.exists(last_ckpt):
                 raise ValueError(
                     f"--train_stage {args.train_stage} requires a pre-trained checkpoint "
@@ -1572,8 +1501,7 @@ def main():
         is_lightweight = getattr(args, "no_cross_attn", False) and getattr(args, "no_prosody_cross_attn", False)
         if is_lightweight:
             apply_curriculum_stage_light(model, args.train_stage, args.unfreeze_top_k,
-                                         freeze_adaln=args.freeze_adaln,
-                                         prosody_global_in_stage1=getattr(args, "prosody_global_in_stage1", False))
+                                         freeze_adaln=args.freeze_adaln)
         else:
             apply_curriculum_stage(model, args.train_stage, args.unfreeze_top_k,
                                    freeze_adaln=args.freeze_adaln)
@@ -1718,7 +1646,26 @@ def main():
                       " Training continues from pretrained weights.")
         
         if is_main and ema and "ema_model_state_dict" in ckpt:
-            ema.load_state_dict(ckpt["ema_model_state_dict"])
+            # strict=False: mirrors the online model's load above. A checkpoint from
+            # an earlier curriculum stage run WITHOUT a module (e.g. duration_predictor
+            # wasn't built because --use_duration_predictor wasn't passed then) won't
+            # have that module's keys. With strict=True this raises
+            # "Missing key(s) in state_dict: ...duration_predictor..." and aborts
+            # training entirely. With strict=False, those params are simply left at
+            # the EMA's own fresh-init values (matching the online model's fresh init
+            # for that new module) — exactly what sync_ema_to_online_for_trainable
+            # right below expects to correct further for trainable params this stage.
+            missing_ema, unexpected_ema = ema.load_state_dict(
+                ckpt["ema_model_state_dict"], strict=False)
+            if missing_ema or unexpected_ema:
+                print(f"  ⚠️ EMA state_dict partial load: {len(missing_ema)} missing, "
+                      f"{len(unexpected_ema)} unexpected keys (expected when this "
+                      f"stage's architecture differs from the checkpoint's, e.g. a "
+                      f"newly-added module). Missing keys use fresh-init EMA values.")
+                if missing_ema:
+                    preview = missing_ema[:5]
+                    print(f"    missing (first {len(preview)}): {preview}"
+                          f"{' ...' if len(missing_ema) > 5 else ''}")
             # Re-seed the EMA shadow with online weights for params that are trainable
             # in THIS stage. Without this, modules frozen in an earlier stage carry a
             # stale (near-init) EMA value that lags badly once they unfreeze, so

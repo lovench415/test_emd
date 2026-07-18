@@ -302,7 +302,7 @@ def extract_and_cache_embeddings(
 
     print(f"Loading prosody encoder: {prosody_backend}...")
     import os as _os
-    _f0_mode = _os.environ.get("F0_NORM_MODE", "legacy")
+    _f0_mode = _os.environ.get("F0_NORM_MODE", "relative_only")
     prosody_enc = ProsodyEncoder(
         backend=prosody_backend,
         f0_norm_mode=_f0_mode,

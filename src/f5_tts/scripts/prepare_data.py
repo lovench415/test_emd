@@ -328,7 +328,7 @@ def extract_and_cache_embeddings(
     # Prosody (pyworld) is CPU-bound → runs in parallel via ThreadPool.
     # Audio loading is I/O-bound → prefetched in background.
     
-    BATCH_SIZE = 8  # 4× larger — GPU handles batches well
+    BATCH_SIZE = 32  # 4× larger — GPU handles batches well
     prosody_on_gpu = prosody_backend in ("rmvpe", "crepe")
     success = 0
     failed = 0
